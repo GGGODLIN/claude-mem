@@ -699,7 +699,7 @@ Use mem_search for every memory search. Guided mode returns readable mem-search 
   },
   {
     name: 'work_state_write',
-    description: 'Your canonical to-do list and working state for this project, kept across sessions: whatever is still open is shown at the start of every session. Each call appends one entry to a list. To-do item: fields {"task": "<name>", "status": "todo" | "doing" | "done" | "dropped", ...details}. State on the list itself: any other fields (the latest value of each key wins; null clears a key; "status": "done" closes the list). Returns what is still open in the list. Params: list (required), fields (required).',
+    description: 'Your canonical to-do list and working state for this project, kept across sessions: whatever is still open is shown at the start of every session. Each call appends one entry to a list. To-do item: fields {"task": "<name>", "status": "todo" | "doing" | "done" | "dropped", ...details}. Same name = same item: reuse it to update; mark a replaced item "dropped". State on the list itself: any other fields (the latest value of each key wins; null clears a key; "status": "done" closes the list). Put running progress in a state key such as "progress". Returns what is still open in the list. Params: list (required), fields (required).',
     inputSchema: {
       type: 'object',
       properties: {
