@@ -19,7 +19,7 @@ const WORK_STATE_RULE = [
   "Use claude-mem's work_state_write tool to track all to-do lists and multi-step work. It is your canonical to-do list: use it instead of any built-in to-do tool. Also use it to track the state of anything you need an ongoing understanding of. Whatever is still open is shown here at the start of every session in this project.",
   '- One list per to-do list or tracked thing: work_state_write with list="<name>" and the fields to set',
   '- To-do item: fields {"task": "<name>", "status": "todo" | "doing" | "done" | "dropped", ...any details}. Same name = same item: reuse it to update; mark a replaced item "dropped"',
-  '- State: fields {"<key>": <value>} (the latest value of each key wins; null clears a key; "status": "done" closes the list). Put running progress in a state key such as "progress"',
+  '- State: fields {"<key>": <value>} (the latest value of each key wins; null clears a key; "status": "done" closes the list — closing a list only hides list-level state; open items inside it still show until each item is marked "done" or "dropped"). Put running progress in a state key such as "progress"',
   '- Read every list, closed items included: work_state_read with includeClosed=true',
 ].join('\n');
 
