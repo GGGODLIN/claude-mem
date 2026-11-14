@@ -383,7 +383,7 @@ export function takeObserverSchemaReminder(session: ActiveSession): boolean {
   return remind;
 }
 
-function clearDebtForAnsweredWork(session: ActiveSession): void {
+export function clearDebtForAnsweredWork(session: ActiveSession): void {
   if (session.lastGeneratorSource === 'init') return;
   session.consecutiveContextOverflows = 0;
   session.consecutiveResponseStalls = 0;
