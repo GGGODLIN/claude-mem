@@ -38,6 +38,7 @@ export type Component =
   | 'IMPORT'
   | 'INGEST'
   | 'OAUTH'
+  | 'OBS_GATE'
   | 'OMP'
   | 'OPENCLAW'
   | 'OPENCODE'
