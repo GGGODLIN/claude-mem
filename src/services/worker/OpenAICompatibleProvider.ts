@@ -145,11 +145,6 @@ const BACKGROUND_AGENT_NAMES = new Set([
   'bg-mem-eco',
   'bg-mem-quality',
 ]);
-const ecoHydrogenSendTimestamps: number[] = [];
-
-export function resetEcoHydrogenSendHistoryForTests(): void {
-  ecoHydrogenSendTimestamps.length = 0;
-}
 
 const OBS_GATE_MODEL = 'openrouter/perplexity/pplx-decider-v1.3:free';
 const OBS_GATE_THRESHOLD = 0.20;
@@ -174,12 +169,12 @@ function readBgMode(): BgMode {
   }
 }
 
-async function canUseEcoHydrogenTail(): Promise<boolean> {
+async function canUseEcoHydrogenTail(sendTimestamps: number[]): Promise<boolean> {
   const now = Date.now();
-  while (ecoHydrogenSendTimestamps.length > 0 && ecoHydrogenSendTimestamps[0]! < now - ECO_HYDROGEN_WINDOW_MS) {
-    ecoHydrogenSendTimestamps.shift();
+  while (sendTimestamps.length > 0 && sendTimestamps[0]! < now - ECO_HYDROGEN_WINDOW_MS) {
+    sendTimestamps.shift();
   }
-  if (ecoHydrogenSendTimestamps.length >= ECO_HYDROGEN_CAP_10M) {
+  if (sendTimestamps.length >= ECO_HYDROGEN_CAP_10M) {
     return false;
   }
   const concurrencyUrl = (process.env.CLAUDE_MEM_MAGPIE_CONCURRENCY_URL ?? DEFAULT_CONCURRENCY_URL).trim();
@@ -215,8 +210,6 @@ async function canUseEcoHydrogenTail(): Promise<boolean> {
 }
 
 function resolveSystemOneUrl(apiUrl: string | undefined): string | null {
-  const override = process.env.CLAUDE_MEM_SYSTEMONE_URL?.trim();
-  if (override) return override;
   const trimmed = (apiUrl ?? '').trim();
   if (!trimmed) return null;
   try {
@@ -331,6 +324,7 @@ async function evaluateObservationGate(params: {
 export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string; model: string; apiUrl?: string; plainText?: boolean }> {
   protected dbManager: DatabaseManager;
   protected sessionManager: SessionManager;
+  private readonly ecoHydrogenSendTimestamps: number[] = [];
 
   /** Human-readable provider name passed to logging + processAgentResponse. */
   protected abstract readonly providerName: string;
@@ -777,7 +771,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     // request preserves the provider's cached prefix. Retire the generation
     // through the existing budget/overflow paths rather than rewriting it.
 
-    const bgMode = config.model === 'mem-observer' || Boolean(process.env.CLAUDE_MEM_BG_MODE_FILE) ? readBgMode() : null;
+    const bgMode = config.model === 'mem-observer' ? readBgMode() : null;
     const writerConfig = bgMode ? { ...config, model: BG_WRITER_MODELS[bgMode] } : config;
 
     session.lastPromptSentAt = Date.now();
@@ -790,13 +784,13 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       if (bgMode !== 'eco' || isAbortError(err) || (isClassified(err) && err.kind === 'context_overflow')) {
         throw err;
       }
-      if (!(await canUseEcoHydrogenTail())) {
+      if (!(await canUseEcoHydrogenTail(this.ecoHydrogenSendTimestamps))) {
         throw new ClassifiedProviderError(
           'Eco Hydrogen fallback yielded while foreground Google key is active or 10m cap reached',
           { kind: 'rate_limit', cause: err, paidSendOutcome: 'refused_before_work' },
         );
       }
-      ecoHydrogenSendTimestamps.push(Date.now());
+      this.ecoHydrogenSendTimestamps.push(Date.now());
       activeWriterModel = ECO_HYDROGEN_FALLBACK_MODEL;
       obsResponse = await this.queryObserverTurn(
         session,

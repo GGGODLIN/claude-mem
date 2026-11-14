@@ -8,7 +8,6 @@ import { ModeManager } from '../../src/services/domain/ModeManager.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { setIngestContext, ingestObservation } from '../../src/services/worker/http/shared.js';
 import { OpenAICompatProvider } from '../../src/services/worker/OpenAICompatProvider.js';
-import { resetEcoHydrogenSendHistoryForTests } from '../../src/services/worker/OpenAICompatibleProvider.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { SessionEventBroadcaster } from '../../src/services/worker/events/SessionEventBroadcaster.js';
 import type { SessionManager } from '../../src/services/worker/SessionManager.js';
@@ -258,7 +257,6 @@ const ENV_KEYS = [
   'CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW',
   'CLAUDE_MEM_OBSERVE_BARE_PROMPTS',
   'CLAUDE_MEM_BG_MODE_FILE',
-  'CLAUDE_MEM_SYSTEMONE_URL',
   'CLAUDE_MEM_MAGPIE_CONCURRENCY_URL',
 ] as const;
 
@@ -362,7 +360,6 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     mkdirSync(tempDir, { recursive: true });
     bgModePath = join(tempDir, 'bg-mode.json');
 
-    resetEcoHydrogenSendHistoryForTests();
     infoLogs = [];
     spies = [
       spyOn(ModeManager, 'getInstance').mockImplementation(() => ({
