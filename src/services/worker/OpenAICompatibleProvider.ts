@@ -132,7 +132,8 @@ const BG_WRITER_MODELS: Record<BgMode, string> = {
 };
 const ECO_HYDROGEN_FALLBACK_MODEL = 'bg-audit-primary';
 const ECO_HYDROGEN_WINDOW_MS = 10 * 60 * 1_000;
-const ECO_HYDROGEN_CAP_10M = 15;
+const ECO_HYDROGEN_CAP_10M = 12;
+const ECO_HYDROGEN_FG_CONCURRENCY_LIMIT = 8;
 const DEFAULT_CONCURRENCY_URL = 'http://127.0.0.1:18417/v1/magpie/concurrency';
 const DEFAULT_CONCURRENCY_TIMEOUT_MS = 2_500;
 const FOREGROUND_GOOGLE_MODEL_RE = /(?:^google\/|gemini-4-(?:argon|carbon|hydrogen)|gemini-pro|gemini-flash)/i;
@@ -187,6 +188,7 @@ async function canUseEcoHydrogenTail(sendTimestamps: number[]): Promise<boolean>
     if (!res.ok) return true;
     const payload = (await res.json()) as { active?: unknown };
     if (!Array.isArray(payload?.active)) return true;
+    let fgGoogleActive = 0;
     for (const item of payload.active) {
       if (!item || typeof item !== 'object') continue;
       const rec = item as Record<string, unknown>;
@@ -198,7 +200,10 @@ async function canUseEcoHydrogenTail(sendTimestamps: number[]): Promise<boolean>
         continue;
       }
       if (provider === 'google' || FOREGROUND_GOOGLE_MODEL_RE.test(model)) {
-        return false;
+        fgGoogleActive += 1;
+        if (fgGoogleActive >= ECO_HYDROGEN_FG_CONCURRENCY_LIMIT) {
+          return false;
+        }
       }
     }
     return true;

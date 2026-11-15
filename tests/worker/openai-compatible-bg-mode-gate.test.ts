@@ -735,17 +735,20 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   });
 
-  it('eco Hydrogen fallback yields when foreground Google key is active, and runs when idle', async () => {
+  it('eco Hydrogen fallback yields when >=8 foreground Google calls are active, and runs below 8', async () => {
     writeFileSync(bgModePath, JSON.stringify({ mode: 'eco' }));
-    let foregroundBusy = true;
+    let fgCount = 8;
 
     const gw = await startFakeGateway({
       onConcurrency: () => ({
         status: 200,
         body: {
-          active: foregroundBusy
-            ? [{ id: 'fg-1', agent: 'claude-code', provider: 'google', model: 'google/gemini-4-carbon' }]
-            : [],
+          active: Array.from({ length: fgCount }, (_, i) => ({
+            id: `fg-${i}`,
+            agent: 'claude-code',
+            provider: 'google',
+            model: 'google/gemini-4-carbon',
+          })),
         },
       }),
       onChat: (req) => {
@@ -770,7 +773,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       process.env.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL = gw.baseUrl;
       process.env.CLAUDE_MEM_MAGPIE_CONCURRENCY_URL = gw.concurrencyUrl;
 
-      // 1) Foreground Google active -> yields (pauses with rate_limit:rate_limit, 0 Hydrogen calls, batch unconfirmed)
+      // 1) >=8 Foreground Google active -> yields (pauses with rate_limit:rate_limit, 0 Hydrogen calls, batch unconfirmed)
       const qBusy = makeQueueAndDb([makeObs(50, { tool_name: 'Edit', tool_input: { file_path: 'fg.ts' }, tool_response: 'ok' })]);
       const busySession = makeSession();
       await expect(
@@ -780,13 +783,13 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       expect(qBusy.confirmCalls).toBe(0);
       expect(gw.chatRequests.map(r => r.body.model)).toEqual(['bg-mem-eco']);
 
-      // 2) Foreground Google idle -> falls back cleanly to bg-audit-primary (Hydrogen) and stores observation
-      foregroundBusy = false;
-      const qIdle = makeQueueAndDb([makeObs(51, { tool_name: 'Edit', tool_input: { file_path: 'fg.ts' }, tool_response: 'ok' })]);
-      await new OpenAICompatProvider(qIdle.dbManager, qIdle.sessionManager).startSession(makeSession());
+      // 2) <8 Foreground Google active (7 active) -> falls back cleanly to bg-audit-primary (Hydrogen) and stores observation
+      fgCount = 7;
+      const qModerate = makeQueueAndDb([makeObs(51, { tool_name: 'Edit', tool_input: { file_path: 'fg.ts' }, tool_response: 'ok' })]);
+      await new OpenAICompatProvider(qModerate.dbManager, qModerate.sessionManager).startSession(makeSession());
       expect(gw.chatRequests.slice(1).map(r => r.body.model)).toEqual(['bg-mem-eco', 'bg-audit-primary']);
-      expect(qIdle.confirmCalls).toBe(1);
-      expect(qIdle.storeObservations).toHaveBeenCalledTimes(1);
+      expect(qModerate.confirmCalls).toBe(1);
+      expect(qModerate.storeObservations).toHaveBeenCalledTimes(1);
     } finally {
       await gw.close();
     }
