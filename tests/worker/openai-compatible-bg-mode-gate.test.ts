@@ -8,6 +8,8 @@ import { ModeManager } from '../../src/services/domain/ModeManager.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { setIngestContext, ingestObservation } from '../../src/services/worker/http/shared.js';
 import { OpenAICompatProvider } from '../../src/services/worker/OpenAICompatProvider.js';
+import { parseBgWriterState } from '../../src/services/worker/OpenAICompatibleProvider.js';
+import { PaidSendBudget } from '../../src/services/worker/paid-send-budget.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { SessionEventBroadcaster } from '../../src/services/worker/events/SessionEventBroadcaster.js';
 import type { SessionManager } from '../../src/services/worker/SessionManager.js';
@@ -127,8 +129,14 @@ interface RecordedSystemOneRequest {
   body: Record<string, unknown>;
 }
 
+interface FakeChatReply {
+  status?: number;
+  headers?: Record<string, string>;
+  body: Record<string, unknown>;
+}
+
 async function startFakeGateway(handlers: {
-  onChat: (req: RecordedChatRequest) => { status?: number; body: Record<string, unknown> } | Promise<{ status?: number; body: Record<string, unknown> }>;
+  onChat: (req: RecordedChatRequest) => FakeChatReply | Promise<FakeChatReply>;
   onSystemOne: (req: RecordedSystemOneRequest, res: ServerResponse) => void | Promise<void>;
   onConcurrency?: () => { status?: number; body: Record<string, unknown> };
 }) {
@@ -163,7 +171,7 @@ async function startFakeGateway(handlers: {
       const record: RecordedChatRequest = { url, headers: req.headers, body };
       chatRequests.push(record);
       const reply = await handlers.onChat(record);
-      res.writeHead(reply.status ?? 200, { 'Content-Type': 'application/json' });
+      res.writeHead(reply.status ?? 200, { 'Content-Type': 'application/json', ...reply.headers });
       res.end(JSON.stringify(reply.body));
       return;
     }
@@ -394,6 +402,325 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     spies.forEach(s => s.mockRestore());
     mock.restore();
     rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const gptState = {
+    mode: 'quality',
+    profile: 'gpt',
+    qualified_tasks: { 'claude-mem/observation': { model: 'codex/gpt-6.1-sol', effort: 'high' } },
+    quota_target: { provider: 'codex', account: 'someone@example.test' },
+  };
+
+  const writerReply = (): FakeChatReply => ({
+    body: {
+      choices: [{ message: { role: 'assistant', content: OBSERVATION_XML }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+    },
+  });
+
+  async function writerGateway(onChat: (req: RecordedChatRequest) => FakeChatReply = writerReply) {
+    const gw = await startFakeGateway({
+      onChat,
+      onSystemOne: (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ answers: { keep_observation: { noul: 0.9 } } }));
+      },
+    });
+    process.env.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL = gw.baseUrl;
+    process.env.CLAUDE_MEM_MAGPIE_CONCURRENCY_URL = gw.concurrencyUrl;
+    return gw;
+  }
+
+  async function observe() {
+    const q = makeQueueAndDb([makeObs(1, {
+      tool_name: 'Edit', tool_input: { file_path: 'writer.ts' }, tool_response: 'updated',
+    })]);
+    const session = makeSession();
+    await new OpenAICompatProvider(q.dbManager, q.sessionManager).startSession(session);
+    return { q, session };
+  }
+
+  function recipe(req: RecordedChatRequest) {
+    return { model: req.body.model, effort: req.body.reasoning_effort, account: req.headers['x-magpie-account'] };
+  }
+
+  function expectGpt(req: RecordedChatRequest) {
+    expect(recipe(req)).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: 'someone@example.test' });
+  }
+
+  function expectStored(q: ReturnType<typeof makeQueueAndDb>) {
+    expect(q.storeObservations.mock.calls[0][2]).toEqual([
+      expect.objectContaining({ title: 'Updated post-draft gatekeeper', narrative: 'Added System One scoring before storing observation drafts.' }),
+    ]);
+    expect(q.confirmCalls).toBe(1);
+  }
+
+  async function positiveControl(gw: Awaited<ReturnType<typeof writerGateway>>) {
+    writeFileSync(bgModePath, JSON.stringify(gptState));
+    const before = gw.chatRequests.length;
+    const result = await observe();
+    expectGpt(gw.chatRequests[before]);
+    expectStored(result.q);
+    return result;
+  }
+
+  it('qualified GPT observation sends model, effort and pinned account, stores the draft, and preserves the session model', async () => {
+    const gw = await writerGateway();
+    try {
+      const { session } = await positiveControl(gw);
+      expect(gw.chatRequests).toHaveLength(1);
+      expect(session.lastModelId).toBe('mem-observer');
+      expect(process.env.CLAUDE_MEM_OPENAI_COMPAT_MODEL).toBe('mem-observer');
+      expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+      expect(infoLogs.some(l => l.component === 'OBS_GATE' && l.message.includes('writer=codex/gpt-6.1-sol'))).toBe(true);
+      expect(gw.systemOneRequests[0].body.model).toBe('openrouter/perplexity/pplx-decider-v1.3:free');
+      expect(gw.systemOneRequests[0].body.reasoning_effort).toBeUndefined();
+      expect(gw.systemOneRequests[0].headers['x-magpie-account']).toBeUndefined();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  const unchangedStates = [
+    ['current with qualified task', JSON.stringify({ ...gptState, profile: 'current' })],
+    ['missing profile', JSON.stringify({ ...gptState, profile: undefined })],
+    ['unknown profile', JSON.stringify({ ...gptState, profile: 'other' })],
+    ['missing task', JSON.stringify({ ...gptState, qualified_tasks: {} })],
+    ['empty model', JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: '' } } })],
+    ['whitespace model', JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: '  ' } } })],
+    ['non-string model', JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: 42 } } })],
+    ['non-object task', JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': 'codex/gpt-6.1-sol' } })],
+    ['array qualified_tasks', JSON.stringify({ ...gptState, qualified_tasks: [] })],
+    ['null qualified_tasks', JSON.stringify({ ...gptState, qualified_tasks: null })],
+    ['string qualified_tasks', JSON.stringify({ ...gptState, qualified_tasks: 'invalid' })],
+    ['missing file', undefined],
+    ['empty file', ''],
+    ['bad JSON', '{broken'],
+    ['array state', '[]'],
+    ['null state', 'null'],
+    ['scalar state', '42'],
+  ] as const;
+
+  for (const [name, raw] of unchangedStates) {
+    it(`keeps the original recipe for ${name}, paired with qualified GPT`, async () => {
+      const gw = await writerGateway();
+      try {
+        await positiveControl(gw);
+        if (raw === undefined) rmSync(bgModePath);
+        else writeFileSync(bgModePath, raw);
+        const { q } = await observe();
+        expect(gw.chatRequests).toHaveLength(2);
+        expect(recipe(gw.chatRequests[1])).toEqual({ model: 'bg-mem-quality', effort: undefined, account: undefined });
+        expectStored(q);
+      } finally {
+        await gw.close();
+      }
+    });
+  }
+
+  it('reader exception keeps the original recipe, paired with qualified GPT', async () => {
+    const gw = await writerGateway();
+    try {
+      await positiveControl(gw);
+      rmSync(bgModePath);
+      mkdirSync(bgModePath);
+      const { q } = await observe();
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'bg-mem-quality', effort: undefined, account: undefined });
+      expectStored(q);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('explicit model bypasses GPT and bg routing, paired with qualified GPT', async () => {
+    const gw = await writerGateway();
+    try {
+      await positiveControl(gw);
+      process.env.CLAUDE_MEM_OPENAI_COMPAT_MODEL = 'user/explicit-model';
+      const { q, session } = await observe();
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'user/explicit-model', effort: undefined, account: undefined });
+      expect(session.lastModelId).toBe('user/explicit-model');
+      expectStored(q);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  for (const [name, quota] of [
+    ['provider mismatch', { provider: 'google', account: 'someone@example.test' }],
+    ['missing quota target', undefined],
+    ['empty account', { provider: 'codex', account: '' }],
+    ['non-string account', { provider: 'codex', account: 42 }],
+    ['empty provider', { provider: '', account: 'someone@example.test' }],
+    ['array quota target', []],
+  ] as const) {
+    it(`omits account header for ${name}, paired with a matching quota target`, async () => {
+      const gw = await writerGateway();
+      try {
+        await positiveControl(gw);
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, quota_target: quota }));
+        const { q } = await observe();
+        expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: undefined });
+        expectStored(q);
+      } finally {
+        await gw.close();
+      }
+    });
+  }
+
+  it('valid task without effort still routes GPT without adding reasoning_effort', async () => {
+    const gw = await writerGateway();
+    try {
+      await positiveControl(gw);
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: 'codex/gpt-6.1-sol' } } }));
+      const { q } = await observe();
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: undefined, account: 'someone@example.test' });
+      expectStored(q);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  function refusal(status: number): FakeChatReply {
+    return { status, headers: { 'Retry-After': '0' }, body: { error: { message: status === 429 ? 'rate limited before work' : 'insufficient_quota' } } };
+  }
+
+  async function fallbackControl(status: number) {
+    writeFileSync(bgModePath, JSON.stringify(gptState));
+    const gw = await writerGateway(req => req.body.model === 'codex/gpt-6.1-sol' ? refusal(status) : writerReply());
+    try {
+      const { q, session } = await observe();
+      expect(gw.chatRequests.length).toBeGreaterThan(1);
+      for (const req of gw.chatRequests.slice(0, -1)) expectGpt(req);
+      expect(gw.chatRequests.filter(r => r.body.model === 'bg-mem-quality')).toHaveLength(1);
+      expect(recipe(gw.chatRequests.at(-1)!)).toEqual({ model: 'bg-mem-quality', effort: undefined, account: undefined });
+      expect(new Set(gw.chatRequests.map(r => r.headers['x-client-request-id'])).size).toBe(1);
+      expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+      expectStored(q);
+      expect(infoLogs.some(l => l.component === 'OBS_GATE' && l.message.includes('writer=bg-mem-quality'))).toBe(true);
+    } finally {
+      await gw.close();
+    }
+  }
+
+  it('429 refusal falls back without charging the rejected GPT sends', async () => {
+    await fallbackControl(429);
+  });
+
+  it('402 insufficient quota is rejected before work and falls back with the same budget', async () => {
+    await fallbackControl(402);
+  });
+
+  for (const failure of ['output failure', 'ambiguous 500'] as const) {
+    it(`${failure} does not gain a fallback send, paired with 429 fallback`, async () => {
+      await fallbackControl(429);
+      const gw = await writerGateway(() => failure === 'output failure'
+        ? { body: { error: { code: 200, message: 'Unable to get json response - Expecting value' } } }
+        : { status: 500, body: { error: { message: 'upstream hiccup' } } });
+      try {
+        writeFileSync(bgModePath, JSON.stringify(gptState));
+        const q = makeQueueAndDb([makeObs(1, { tool_name: 'Edit', tool_input: {}, tool_response: 'updated' })]);
+        const session = makeSession();
+        const run = new OpenAICompatProvider(q.dbManager, q.sessionManager).startSession(session);
+        if (failure === 'output failure') await run;
+        else await expect(run).rejects.toThrow();
+        expect(gw.chatRequests).toHaveLength(1);
+        expectGpt(gw.chatRequests[0]);
+        expect(q.storeObservations).not.toHaveBeenCalled();
+        expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+      } finally {
+        await gw.close();
+      }
+    });
+  }
+
+  it('eco GPT refusal returns to bg-mem-eco then the existing Hydrogen tail without leaking options', async () => {
+    writeFileSync(bgModePath, JSON.stringify({ ...gptState, mode: 'eco' }));
+    const gw = await writerGateway(req => {
+      if (req.body.model === 'codex/gpt-6.1-sol') return refusal(429);
+      if (req.body.model === 'bg-mem-eco') return refusal(402);
+      return writerReply();
+    });
+    try {
+      const { q, session } = await observe();
+      expectGpt(gw.chatRequests[0]);
+      const defaults = gw.chatRequests.filter(r => r.body.model !== 'codex/gpt-6.1-sol');
+      expect(defaults.map(recipe)).toEqual([
+        { model: 'bg-mem-eco', effort: undefined, account: undefined },
+        { model: 'bg-audit-primary', effort: undefined, account: undefined },
+      ]);
+      expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+      expectStored(q);
+      expect(infoLogs.some(l => l.component === 'OBS_GATE' && l.message.includes('writer=bg-audit-primary'))).toBe(true);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('switching GPT back to current restores the full original body and headers', async () => {
+    const gw = await writerGateway();
+    try {
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, profile: 'current' }));
+      await observe();
+      await positiveControl(gw);
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, profile: 'current' }));
+      const { q } = await observe();
+      expect(gw.chatRequests).toHaveLength(3);
+      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'bg-mem-quality', effort: undefined, account: undefined });
+      expect(gw.chatRequests[2].body).toEqual(gw.chatRequests[0].body);
+      const headersWithoutTrace = (req: RecordedChatRequest) => Object.fromEntries(
+        Object.entries(req.headers).filter(([name]) => name !== 'x-client-request-id'),
+      );
+      expect(headersWithoutTrace(gw.chatRequests[2])).toEqual(headersWithoutTrace(gw.chatRequests[0]));
+      expectStored(q);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('GPT context overflow recycles without falling back, paired with 429 fallback', async () => {
+    await fallbackControl(429);
+    const gw = await writerGateway(() => ({ status: 400, body: { error: { message: 'context_length_exceeded' } } }));
+    try {
+      const { q, session } = await observe();
+      expect(gw.chatRequests).toHaveLength(1);
+      expectGpt(gw.chatRequests[0]);
+      expect(session.abortReason).toBe('overflow:recycle');
+      expect(session.consecutiveContextOverflows).toBe(1);
+      expect(session.paidSendBudget?.spentPaidSends).toBe(0);
+      expect(q.storeObservations).not.toHaveBeenCalled();
+      expect(q.confirmCalls).toBe(0);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('GPT cannot replace an exhausted claimed-batch budget, paired with a fresh GPT budget', async () => {
+    const gw = await writerGateway();
+    try {
+      await positiveControl(gw);
+      const q = makeQueueAndDb([makeObs(1, { tool_name: 'Edit', tool_input: {}, tool_response: 'updated' })]);
+      const budget = new PaidSendBudget(1);
+      budget.recordPaidSend();
+      budget.recordPaidSend();
+      const session = makeSession({ paidSendBudget: budget });
+      await expect(new OpenAICompatProvider(q.dbManager, q.sessionManager).startSession(session)).rejects.toThrow('already made 2 paid sends');
+      expect(gw.chatRequests).toHaveLength(1);
+      expect(session.paidSendBudget).toBe(budget);
+      expect(budget.spentPaidSends).toBe(2);
+      expect(q.storeObservations).not.toHaveBeenCalled();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('pure state parser preserves eco and rejects malformed or unqualified GPT state', () => {
+    expect(parseBgWriterState(JSON.stringify(gptState))).toEqual({
+      mode: 'quality',
+      gptWriter: { model: 'codex/gpt-6.1-sol', requestOptions: { reasoningEffort: 'high', headers: { 'X-Magpie-Account': 'someone@example.test' } } },
+    });
+    expect(parseBgWriterState('{')).toEqual({ mode: 'quality' });
+    expect(parseBgWriterState(JSON.stringify({ ...gptState, profile: 'current', mode: 'eco' }))).toEqual({ mode: 'eco' });
   });
 
   it('routes observation writer model to bg-mem-quality or bg-mem-eco from bg-mode.json (missing/corrupt falls back to quality)', async () => {
@@ -661,8 +988,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   }, 10_000);
 
-  it('passes Stop <summary> and compressField straight through with 0 /v1/systemone calls (F5)', async () => {
-    writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
+  it('GPT profile leaves Stop summary and field compression on the original recipe (F5)', async () => {
+    writeFileSync(bgModePath, JSON.stringify(gptState));
 
     const gw = await startFakeGateway({
       onChat: (req) => {
@@ -710,7 +1037,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       await new OpenAICompatProvider(qSummary.dbManager, qSummary.sessionManager).startSession(summarySession);
 
       expect(gw.chatRequests).toHaveLength(1);
-      expect(gw.chatRequests[0].body.model).toBe('mem-observer');
+      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'mem-observer', effort: undefined, account: undefined });
       expect(gw.systemOneRequests).toHaveLength(0);
       expect(qSummary.storeObservations).toHaveBeenCalledTimes(1);
       expect(summarySession.lastContextTokens).toBe(400);
@@ -727,8 +1054,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       await new OpenAICompatProvider(qObsWithCompress.dbManager, qObsWithCompress.sessionManager).startSession(makeSession());
 
       expect(gw.chatRequests).toHaveLength(3); // summary + compressField + observation
-      expect(gw.chatRequests[1].body.model).toBe('mem-observer');
-      expect(gw.chatRequests[2].body.model).toBe('bg-mem-quality');
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'mem-observer', effort: undefined, account: undefined });
+      expectGpt(gw.chatRequests[2]);
       expect(gw.systemOneRequests).toHaveLength(1);
     } finally {
       await gw.close();

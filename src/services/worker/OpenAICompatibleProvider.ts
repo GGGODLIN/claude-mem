@@ -158,15 +158,60 @@ function normalizeGateField(value: unknown, maxChars: number): string {
   return text.length <= maxChars ? text : text.slice(0, maxChars);
 }
 
-function readBgMode(): BgMode {
+export interface OpenAIObservationRequestOptions {
+  reasoningEffort?: string;
+  headers?: Record<string, string>;
+}
+
+interface BgWriterState {
+  mode: BgMode;
+  gptWriter?: {
+    model: string;
+    requestOptions: OpenAIObservationRequestOptions;
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+export function parseBgWriterState(raw: string): BgWriterState {
+  try {
+    const state: unknown = JSON.parse(raw);
+    if (!isRecord(state)) return { mode: 'quality' };
+    const mode = state.mode === 'eco' ? 'eco' : 'quality';
+    const task = isRecord(state.qualified_tasks) ? state.qualified_tasks['claude-mem/observation'] : undefined;
+    if (state.profile !== 'gpt' || !isRecord(task) || !isNonEmptyString(task.model)) return { mode };
+
+    const quota = state.quota_target;
+    const provider = task.model.includes('/') ? task.model.split('/')[0] : undefined;
+    const account = isRecord(quota) && isNonEmptyString(quota.provider) && isNonEmptyString(quota.account)
+      && quota.provider === provider ? quota.account : undefined;
+    return {
+      mode,
+      gptWriter: {
+        model: task.model,
+        requestOptions: {
+          ...(isNonEmptyString(task.effort) ? { reasoningEffort: task.effort } : {}),
+          ...(account ? { headers: { 'X-Magpie-Account': account } } : {}),
+        },
+      },
+    };
+  } catch {
+    return { mode: 'quality' };
+  }
+}
+
+function readBgWriterState(): BgWriterState {
   const filePath = process.env.CLAUDE_MEM_BG_MODE_FILE || join(homedir(), '.magpie-machine/home/.config/magpie/bg-mode.json');
   try {
-    const raw = readFileSync(filePath, 'utf-8').trim();
-    if (!raw) return 'quality';
-    const parsed = JSON.parse(raw) as { mode?: unknown };
-    return parsed && typeof parsed === 'object' && parsed.mode === 'eco' ? 'eco' : 'quality';
+    return parseBgWriterState(readFileSync(filePath, 'utf-8'));
   } catch {
-    return 'quality';
+    return { mode: 'quality' };
   }
 }
 
@@ -342,6 +387,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
    * preserves that per-provider divergence.
    */
   protected abstract readonly forwardEmptyMessageResponse: boolean;
+  protected readonly supportsObservationRequestOptions: boolean = false;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     this.dbManager = dbManager;
@@ -383,6 +429,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     perAttemptTimeoutMs?: number,
     paidSendBudget?: PaidSendBudget,
     label?: ObserverRequestLabel,
+    requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ProviderQueryResult>;
 
   /**
@@ -776,33 +823,58 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     // request preserves the provider's cached prefix. Retire the generation
     // through the existing budget/overflow paths rather than rewriting it.
 
-    const bgMode = config.model === 'mem-observer' ? readBgMode() : null;
+    const bgState = config.model === 'mem-observer' ? readBgWriterState() : null;
+    const bgMode = bgState?.mode ?? null;
     const writerConfig = bgMode ? { ...config, model: BG_WRITER_MODELS[bgMode] } : config;
+    const gptWriter = this.supportsObservationRequestOptions ? bgState?.gptWriter : undefined;
+    const paidSendBudget = paidSendBudgetForClaimedBatch(session);
 
     session.lastPromptSentAt = Date.now();
     session.lastGeneratorSource = 'ingest';
-    let obsResponse: ProviderQueryResult;
     let activeWriterModel = writerConfig.model;
-    try {
-      obsResponse = await this.queryObserverTurn(session, writerConfig, paidSendBudgetForClaimedBatch(session), 'observation');
-    } catch (err: unknown) {
-      if (bgMode !== 'eco' || isAbortError(err) || (isClassified(err) && err.kind === 'context_overflow')) {
-        throw err;
-      }
-      if (!(await canUseEcoHydrogenTail(this.ecoHydrogenSendTimestamps))) {
-        throw new ClassifiedProviderError(
-          'Eco Hydrogen fallback yielded while foreground Google key is active or 10m cap reached',
-          { kind: 'rate_limit', cause: err, paidSendOutcome: 'refused_before_work' },
+    const queryDefaultWriter = async (): Promise<ProviderQueryResult> => {
+      activeWriterModel = writerConfig.model;
+      try {
+        return await this.queryObserverTurn(session, writerConfig, paidSendBudget, 'observation');
+      } catch (err: unknown) {
+        if (bgMode !== 'eco' || isAbortError(err) || (isClassified(err) && err.kind === 'context_overflow')) {
+          throw err;
+        }
+        if (!(await canUseEcoHydrogenTail(this.ecoHydrogenSendTimestamps))) {
+          throw new ClassifiedProviderError(
+            'Eco Hydrogen fallback yielded while foreground Google key is active or 10m cap reached',
+            { kind: 'rate_limit', cause: err, paidSendOutcome: 'refused_before_work' },
+          );
+        }
+        this.ecoHydrogenSendTimestamps.push(Date.now());
+        activeWriterModel = ECO_HYDROGEN_FALLBACK_MODEL;
+        return this.queryObserverTurn(
+          session,
+          { ...config, model: ECO_HYDROGEN_FALLBACK_MODEL },
+          paidSendBudget,
+          'observation',
         );
       }
-      this.ecoHydrogenSendTimestamps.push(Date.now());
-      activeWriterModel = ECO_HYDROGEN_FALLBACK_MODEL;
-      obsResponse = await this.queryObserverTurn(
-        session,
-        { ...config, model: ECO_HYDROGEN_FALLBACK_MODEL },
-        paidSendBudgetForClaimedBatch(session),
-        'observation',
-      );
+    };
+
+    let obsResponse: ProviderQueryResult;
+    if (gptWriter) {
+      activeWriterModel = gptWriter.model;
+      try {
+        obsResponse = await this.queryObserverTurn(
+          session, { ...config, model: gptWriter.model }, paidSendBudget, 'observation', gptWriter.requestOptions,
+        );
+      } catch (err: unknown) {
+        const outcome = paidSendOutcomeOf(err);
+        // Rejected/refused sends cost nothing; ambiguous or billed failures must not gain another route.
+        if (isAbortError(err) || (isClassified(err) && (err.kind === 'context_overflow' || err.code === PAID_SEND_BUDGET_EXHAUSTED_CODE))
+          || (outcome !== 'refused_before_work' && outcome !== 'rejected')) {
+          throw err;
+        }
+        obsResponse = await queryDefaultWriter();
+      }
+    } else {
+      obsResponse = await queryDefaultWriter();
     }
 
     // Billed usage counts even when the reply came back empty.
@@ -955,10 +1027,11 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     config: TConfig,
     paidSendBudget: PaidSendBudget | undefined,
     kind: ObserverRequestLabel['kind'],
+    requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ProviderQueryResult> {
     try {
       return await this.query(
-        session.conversationHistory, config, undefined, undefined, paidSendBudget, generationLabel(session, kind),
+        session.conversationHistory, config, undefined, undefined, paidSendBudget, generationLabel(session, kind), requestOptions,
       );
     } catch (error: unknown) {
       if (!isClassified(error) || paidSendOutcomeOf(error) !== 'output_failure') throw error;

@@ -11,11 +11,11 @@
  * carries the cmem.ai gateway's credential-pinning rules, and neither should
  * follow a user to NVIDIA.
  *
- * What this sends is deliberately plain — model, messages, temperature, the
+ * The default request stays plain — model, messages, temperature, the
  * output-token cap, and the standard OpenAI streaming fields (`stream`,
- * `stream_options.include_usage`), nothing else. Strict endpoints (vLLM in
- * particular) reject unknown body fields, so there is no vendor-specific
- * extra; one that refuses the streaming fields is sent the plain body instead
+ * `stream_options.include_usage`). Strict endpoints (vLLM in particular) reject
+ * unknown fields, so effort and account headers are opt-in for qualified
+ * observations only; one that refuses the streaming fields gets the plain body instead
  * (streamed-chat-completion.ts). Token counts are used when the endpoint
  * reports them and are never estimated into the usage event, matching the rule OpenRouter's
  * `buildLastUsage` already enforces: real numbers on both sides or none.
@@ -53,6 +53,8 @@ import {
   OpenAICompatibleProvider,
   assistantText,
   type OpenAIChatMessage,
+  type OpenAIObservationRequestOptions,
+  type ObserverRequestLabel,
   type ProviderQueryResult,
 } from './OpenAICompatibleProvider.js';
 
@@ -423,6 +425,7 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
   // Match OpenRouter: forward the empty batch so the parser/recovery path sees
   // it, rather than dropping it the way Gemini does.
   protected readonly forwardEmptyMessageResponse = true;
+  protected readonly supportsObservationRequestOptions = true;
 
   constructor(dbManager: DatabaseManager, sessionManager: SessionManager) {
     super(dbManager, sessionManager);
@@ -481,13 +484,15 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
     signal?: AbortSignal,
     perAttemptTimeoutMs?: number,
     paidSendBudget?: PaidSendBudget,
+    _label?: ObserverRequestLabel,
+    requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ProviderQueryResult> {
     if (!config.apiUrl || !config.model) {
       throw this.missingApiKeyError();
     }
     return withKeyPool(
       { poolId: 'openai-compatible', keys: resolvePoolKeys(config), label: config.preset.label, rateLimitUntilNextKey },
-      ({ key, poolSize }) => this.queryChatCompletions(history, key, poolSize, config, signal, perAttemptTimeoutMs, paidSendBudget),
+      ({ key, poolSize }) => this.queryChatCompletions(history, key, poolSize, config, signal, perAttemptTimeoutMs, paidSendBudget, requestOptions),
     );
   }
 
@@ -509,6 +514,7 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
     clientAttemptId: string,
     attemptSignal: AbortSignal,
     liveness: StreamLiveness | null,
+    requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ChatCompletionExchange> {
     const label = config.preset.label;
     return sendChatCompletion({
@@ -520,11 +526,13 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
         // Local servers accept any token or none; sending an empty bearer to
         // them is worse than sending no header at all.
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        ...requestOptions?.headers,
       },
       body: {
         model: config.model,
         messages,
         temperature: 0.3,
+        ...(requestOptions?.reasoningEffort !== undefined ? { reasoning_effort: requestOptions.reasoningEffort } : {}),
         ...(liveness ? STREAMED_REQUEST_FIELDS : {}),
       },
       maxOutputTokens,
@@ -544,6 +552,7 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
     signal?: AbortSignal,
     perAttemptTimeoutMs?: number,
     paidSendBudget?: PaidSendBudget,
+    requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ProviderQueryResult> {
     const messages = this.conversationToOpenAIMessages(history);
     const label = config.preset.label;
@@ -560,7 +569,7 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
     const streamed = streamsChatCompletion(config.apiUrl);
     const liveness = streamed ? resolveStreamLiveness(perAttemptTimeoutMs, this.streamIdleTimeoutMs) : null;
     const data = await withRetry<ChatCompletionResponse>(async (attemptSignal) => {
-      const exchange = await this.requestChatCompletion(config, apiKey, messages, maxOutputTokens, clientAttemptId, attemptSignal, liveness);
+      const exchange = await this.requestChatCompletion(config, apiKey, messages, maxOutputTokens, clientAttemptId, attemptSignal, liveness, requestOptions);
       const responseData = exchange.body as ChatCompletionResponse;
 
       // Some gateways report failure in a 200 body (the case #3263 hit through
