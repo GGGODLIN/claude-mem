@@ -163,14 +163,6 @@ export interface OpenAIObservationRequestOptions {
   headers?: Record<string, string>;
 }
 
-interface BgWriterState {
-  mode: BgMode;
-  gptWriter?: {
-    model: string;
-    requestOptions: OpenAIObservationRequestOptions;
-  };
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -179,7 +171,13 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-export function parseBgWriterState(raw: string): BgWriterState {
+export function parseBgWriterState(raw: string): {
+  mode: BgMode;
+  gptWriter?: {
+    model: string;
+    requestOptions: OpenAIObservationRequestOptions;
+  };
+} {
   try {
     const state: unknown = JSON.parse(raw);
     if (!isRecord(state)) return { mode: 'quality' };
@@ -206,7 +204,7 @@ export function parseBgWriterState(raw: string): BgWriterState {
   }
 }
 
-function readBgWriterState(): BgWriterState {
+function readBgWriterState(): ReturnType<typeof parseBgWriterState> {
   const filePath = process.env.CLAUDE_MEM_BG_MODE_FILE || join(homedir(), '.magpie-machine/home/.config/magpie/bg-mode.json');
   try {
     return parseBgWriterState(readFileSync(filePath, 'utf-8'));
