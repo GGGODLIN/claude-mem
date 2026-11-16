@@ -445,7 +445,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   }
 
   function expectGpt(req: RecordedChatRequest) {
-    expect(recipe(req)).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: 'someone@example.test' });
+    expect(recipe(req)).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: 'someone%40example.test' });
   }
 
   function expectStored(q: ReturnType<typeof makeQueueAndDb>) {
@@ -574,7 +574,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       await positiveControl(gw);
       writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: 'codex/gpt-6.1-sol' } } }));
       const { q } = await observe();
-      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: undefined, account: 'someone@example.test' });
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: undefined, account: 'someone%40example.test' });
       expectStored(q);
     } finally {
       await gw.close();
@@ -609,6 +609,39 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
 
   it('402 insufficient quota is rejected before work and falls back with the same budget', async () => {
     await fallbackControl(402);
+  });
+
+  it('a watched account in other letters is sent percent-encoded and reaches the gateway', async () => {
+    const gw = await writerGateway();
+    try {
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, quota_target: { provider: 'codex', account: '北冥' } }));
+      const { q, session } = await observe();
+      expect(gw.chatRequests).toHaveLength(1);
+      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: '%E5%8C%97%E5%86%A5' });
+      expectStored(q);
+      expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('a session cancelled while its GPT send is refused gains no default writer send, paired with 402 fallback', async () => {
+    await fallbackControl(402);
+    const session = makeSession();
+    const gw = await writerGateway(() => {
+      session.abortController.abort();
+      return refusal(402);
+    });
+    try {
+      writeFileSync(bgModePath, JSON.stringify(gptState));
+      const q = makeQueueAndDb([makeObs(1, { tool_name: 'Edit', tool_input: {}, tool_response: 'updated' })]);
+      await new OpenAICompatProvider(q.dbManager, q.sessionManager).startSession(session).catch(() => undefined);
+      expect(gw.chatRequests.length).toBeGreaterThan(0);
+      for (const req of gw.chatRequests) expectGpt(req);
+      expect(q.storeObservations).not.toHaveBeenCalled();
+    } finally {
+      await gw.close();
+    }
   });
 
   for (const failure of ['output failure', 'ambiguous 500'] as const) {
@@ -717,7 +750,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   it('pure state parser preserves eco and rejects malformed or unqualified GPT state', () => {
     expect(parseBgWriterState(JSON.stringify(gptState))).toEqual({
       mode: 'quality',
-      gptWriter: { model: 'codex/gpt-6.1-sol', requestOptions: { reasoningEffort: 'high', headers: { 'X-Magpie-Account': 'someone@example.test' } } },
+      gptWriter: { model: 'codex/gpt-6.1-sol', requestOptions: { reasoningEffort: 'high', headers: { 'X-Magpie-Account': 'someone%40example.test' } } },
     });
     expect(parseBgWriterState('{')).toEqual({ mode: 'quality' });
     expect(parseBgWriterState(JSON.stringify({ ...gptState, profile: 'current', mode: 'eco' }))).toEqual({ mode: 'eco' });

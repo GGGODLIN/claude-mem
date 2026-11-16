@@ -195,7 +195,8 @@ export function parseBgWriterState(raw: string): {
         model: task.model,
         requestOptions: {
           ...(isNonEmptyString(task.effort) ? { reasoningEffort: task.effort } : {}),
-          ...(account ? { headers: { 'X-Magpie-Account': account } } : {}),
+          // The gateway reads this header percent-decoded; a raw non-ASCII name is not a valid header value.
+          ...(account ? { headers: { 'X-Magpie-Account': encodeURIComponent(account) } } : {}),
         },
       },
     };
@@ -869,6 +870,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
           || (outcome !== 'refused_before_work' && outcome !== 'rejected')) {
           throw err;
         }
+        // A session cancelled while the GPT send was in flight must not start another paid send.
+        session.abortController.signal.throwIfAborted();
         obsResponse = await queryDefaultWriter();
       }
     } else {
