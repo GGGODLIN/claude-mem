@@ -158,6 +158,9 @@ function normalizeGateField(value: unknown, maxChars: number): string {
   return text.length <= maxChars ? text : text.slice(0, maxChars);
 }
 
+/** The relay header that makes it try one account only. */
+export const PINNED_ACCOUNT_HEADER = 'X-Magpie-Account';
+
 export interface OpenAIObservationRequestOptions {
   reasoningEffort?: string;
   headers?: Record<string, string>;
@@ -196,7 +199,7 @@ export function parseBgWriterState(raw: string): {
         requestOptions: {
           ...(isNonEmptyString(task.effort) ? { reasoningEffort: task.effort } : {}),
           // The gateway reads this header percent-decoded; a raw non-ASCII name is not a valid header value.
-          ...(account ? { headers: { 'X-Magpie-Account': encodeURIComponent(account) } } : {}),
+          ...(account ? { headers: { [PINNED_ACCOUNT_HEADER]: encodeURIComponent(account) } } : {}),
         },
       },
     };
@@ -865,9 +868,14 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
         );
       } catch (err: unknown) {
         const outcome = paidSendOutcomeOf(err);
-        // Rejected/refused sends cost nothing; ambiguous or billed failures must not gain another route.
-        if (isAbortError(err) || (isClassified(err) && (err.kind === 'context_overflow' || err.code === PAID_SEND_BUDGET_EXHAUSTED_CODE))
-          || (outcome !== 'refused_before_work' && outcome !== 'rejected')) {
+        // Only a send proven unbilled may gain another route. `rejected` as the mere default of an
+        // error nobody classified further (a failure reported inside a 200 stream) proves nothing.
+        const provenUnbilled = isClassified(err) && (
+          outcome === 'refused_before_work'
+          || (outcome === 'rejected' && (err.paidSendOutcome === 'rejected' || err.kind === 'quota_exhausted' || err.kind === 'auth_invalid'))
+        );
+        if (isAbortError(err) || !provenUnbilled
+          || (isClassified(err) && (err.kind === 'context_overflow' || err.code === PAID_SEND_BUDGET_EXHAUSTED_CODE))) {
           throw err;
         }
         // A session cancelled while the GPT send was in flight must not start another paid send.

@@ -7,7 +7,7 @@ import { join } from 'path';
 import { ModeManager } from '../../src/services/domain/ModeManager.js';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { setIngestContext, ingestObservation } from '../../src/services/worker/http/shared.js';
-import { OpenAICompatProvider } from '../../src/services/worker/OpenAICompatProvider.js';
+import { OpenAICompatProvider, withoutPinnedAccount } from '../../src/services/worker/OpenAICompatProvider.js';
 import { parseBgWriterState } from '../../src/services/worker/OpenAICompatibleProvider.js';
 import { PaidSendBudget } from '../../src/services/worker/paid-send-budget.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
@@ -357,6 +357,11 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   let bgModePath: string;
   let spies: ReturnType<typeof spyOn>[];
   let infoLogs: Array<{ component: string; message: string; context?: unknown }>;
+  let loudLogs: string[];
+  // Errors do not survive JSON.stringify, so their text and their cause's text are spelled out.
+  const logText = (args: unknown[]): string => args.map(arg => arg instanceof Error
+    ? `${arg.message} ${arg.cause instanceof Error ? arg.cause.message : ''}`
+    : JSON.stringify(arg) ?? '').join(' ');
 
   beforeEach(() => {
     savedEnv = {};
@@ -369,6 +374,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     bgModePath = join(tempDir, 'bg-mode.json');
 
     infoLogs = [];
+    loudLogs = [];
     spies = [
       spyOn(ModeManager, 'getInstance').mockImplementation(() => ({
         getActiveMode: () => mockMode,
@@ -378,8 +384,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       spyOn(logger, 'info').mockImplementation((component: Component, message: string, context?: unknown) => {
         infoLogs.push({ component, message, context });
       }),
-      spyOn(logger, 'warn').mockImplementation(() => {}),
-      spyOn(logger, 'error').mockImplementation(() => {}),
+      spyOn(logger, 'warn').mockImplementation((...args: unknown[]) => { loudLogs.push(logText(args)); }),
+      spyOn(logger, 'error').mockImplementation((...args: unknown[]) => { loudLogs.push(logText(args)); }),
       spyOn(logger, 'success').mockImplementation(() => {}),
       spyOn(logger, 'failure').mockImplementation(() => {}),
     ];
@@ -585,9 +591,9 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     return { status, headers: { 'Retry-After': '0' }, body: { error: { message: status === 429 ? 'rate limited before work' : 'insufficient_quota' } } };
   }
 
-  async function fallbackControl(status: number) {
+  async function fallbackControl(status: number, refused: FakeChatReply = refusal(status)) {
     writeFileSync(bgModePath, JSON.stringify(gptState));
-    const gw = await writerGateway(req => req.body.model === 'codex/gpt-6.1-sol' ? refusal(status) : writerReply());
+    const gw = await writerGateway(req => req.body.model === 'codex/gpt-6.1-sol' ? refused : writerReply());
     try {
       const { q, session } = await observe();
       expect(gw.chatRequests.length).toBeGreaterThan(1);
@@ -666,6 +672,36 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       }
     });
   }
+
+  it('a failure inside a 200 reply that nothing classifies gains no fallback send, paired with a declared 400 fallback', async () => {
+    await fallbackControl(400, { status: 400, body: { error: { message: 'model is not supported' } } });
+    const gw = await writerGateway(() => ({ body: { error: { message: 'the stream broke upstream' } } }));
+    try {
+      writeFileSync(bgModePath, JSON.stringify(gptState));
+      const q = makeQueueAndDb([makeObs(1, { tool_name: 'Edit', tool_input: {}, tool_response: 'updated' })]);
+      await new OpenAICompatProvider(q.dbManager, q.sessionManager).startSession(makeSession()).catch(() => undefined);
+      expect(gw.chatRequests.length).toBeGreaterThan(0);
+      for (const req of gw.chatRequests) expectGpt(req);
+      expect(q.storeObservations).not.toHaveBeenCalled();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('a refusal that names the pinned account never carries it into the logs or the error', async () => {
+    const named = { status: 429, headers: { 'Retry-After': '0' }, body: { error: { message: 'codex someone@example.test rests until 2026-11-17T03:00:00Z (rate limit)' } } };
+    await fallbackControl(429, named);
+    // Positive control: the warn line for the refused send was captured, so its absence below means something.
+    expect(loudLogs.some(line => line.includes('rests until'))).toBe(true);
+    for (const line of [...loudLogs, ...infoLogs.map(l => logText([l.message, l.context]))]) {
+      expect(line.includes('someone@example.test') || line.includes('someone%40example.test')).toBe(false);
+    }
+
+    const options = { headers: { 'X-Magpie-Account': 'someone%40example.test' } };
+    expect(withoutPinnedAccount('codex someone@example.test rests; pinned someone%40example.test', options)).toBe('codex [pinned account] rests; pinned [pinned account]');
+    expect(withoutPinnedAccount('codex someone@example.test rests', undefined)).toBe('codex someone@example.test rests');
+    expect(withoutPinnedAccount('100% of %zz', { headers: { 'X-Magpie-Account': '%zz' } })).toBe('100% of [pinned account]');
+  });
 
   it('eco GPT refusal returns to bg-mem-eco then the existing Hydrogen tail without leaking options', async () => {
     writeFileSync(bgModePath, JSON.stringify({ ...gptState, mode: 'eco' }));

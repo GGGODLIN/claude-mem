@@ -53,6 +53,7 @@ import {
   OpenAICompatibleProvider,
   assistantText,
   type OpenAIChatMessage,
+  PINNED_ACCOUNT_HEADER,
   type OpenAIObservationRequestOptions,
   type ObserverRequestLabel,
   type ProviderQueryResult,
@@ -298,6 +299,8 @@ export function classifyOpenAICompatError(input: {
   if (status === 404) {
     return new ClassifiedProviderError(describe('not found'), {
       kind: 'unrecoverable',
+      // Stated, not left to the default: a declared 4xx refused the request before any work.
+      paidSendOutcome: 'rejected',
       cause: input.cause,
       action: 'Verify CLAUDE_MEM_OPENAI_COMPAT_BASE_URL and _MODEL — a 404 here usually means the base URL is wrong or the endpoint does not serve that model.',
     });
@@ -306,6 +309,7 @@ export function classifyOpenAICompatError(input: {
   if (status === 400 || status === 422) {
     return new ClassifiedProviderError(describe('bad request'), {
       kind: 'unrecoverable',
+      paidSendOutcome: 'rejected',
       cause: input.cause,
     });
   }
@@ -341,6 +345,23 @@ export function classifyOpenAICompatError(input: {
     kind: 'unrecoverable',
     cause: input.cause,
   });
+}
+
+/**
+ * A relay that refuses a pinned account names it in the refusal. That text goes
+ * into the classified error and from there into the logs, so the account is
+ * taken out before classification.
+ */
+export function withoutPinnedAccount(text: string, requestOptions?: OpenAIObservationRequestOptions): string {
+  const sent = requestOptions?.headers?.[PINNED_ACCOUNT_HEADER];
+  if (!sent) return text;
+  let account = sent;
+  try {
+    account = decodeURIComponent(sent);
+  } catch {
+    // Not percent-encoded after all: the sent value is the account.
+  }
+  return [account, sent].reduce((out, name) => out.split(name).join('[pinned account]'), text);
 }
 
 /**
@@ -539,7 +560,12 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
       signal: attemptSignal,
       liveness,
       label,
-      classify: (input) => classifyOpenAICompatError({ ...input, endpointLabel: label, requestUrl: config.apiUrl }),
+      classify: (input) => classifyOpenAICompatError({
+        ...input,
+        ...(input.bodyText !== undefined ? { bodyText: withoutPinnedAccount(input.bodyText, requestOptions) } : {}),
+        endpointLabel: label,
+        requestUrl: config.apiUrl,
+      }),
     });
   }
 
@@ -577,9 +603,9 @@ export class OpenAICompatProvider extends OpenAICompatibleProvider<OpenAICompatC
       if (responseData.error) {
         throw classifyOpenAICompatError({
           status: exchange.status,
-          bodyText: JSON.stringify(responseData),
+          bodyText: withoutPinnedAccount(JSON.stringify(responseData), requestOptions),
           headers: exchange.headers,
-          cause: new Error(`${label} API error: ${responseData.error.code} - ${responseData.error.message}`),
+          cause: new Error(withoutPinnedAccount(`${label} API error: ${responseData.error.code} - ${responseData.error.message}`, requestOptions)),
           endpointLabel: label,
         });
       }
