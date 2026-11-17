@@ -147,7 +147,7 @@ const BACKGROUND_AGENT_NAMES = new Set([
   'bg-mem-quality',
 ]);
 
-const OBS_GATE_MODEL = 'openrouter/perplexity/pplx-decider-v1.3:free';
+const OBS_GATE_MODEL = 'group/obs-gate';
 const OBS_GATE_THRESHOLD = 0.20;
 const DEFAULT_SYSTEMONE_TIMEOUT_MS = 5_000;
 const SYSTEMONE_INSTRUCTIONS =

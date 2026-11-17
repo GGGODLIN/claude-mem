@@ -479,7 +479,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       expect(process.env.CLAUDE_MEM_OPENAI_COMPAT_MODEL).toBe('mem-observer');
       expect(session.paidSendBudget?.spentPaidSends).toBe(1);
       expect(infoLogs.some(l => l.component === 'OBS_GATE' && l.message.includes('writer=codex/gpt-6.1-sol'))).toBe(true);
-      expect(gw.systemOneRequests[0].body.model).toBe('openrouter/perplexity/pplx-decider-v1.3:free');
+      expect(gw.systemOneRequests[0].body.model).toBe('group/obs-gate');
       expect(gw.systemOneRequests[0].body.reasoning_effort).toBeUndefined();
       expect(gw.systemOneRequests[0].headers['x-magpie-account']).toBeUndefined();
     } finally {
@@ -879,7 +879,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const score = gw.systemOneRequests.length === 1 ? 0.20 : 0.19;
       const questions = req.body.questions as { keep_observation?: { type?: string } } | undefined;
-        expect(req.body.model).toBe('openrouter/perplexity/pplx-decider-v1.3:free');
+        expect(req.body.model).toBe('group/obs-gate');
         expect(req.headers.authorization).toBe('Bearer synthetic-gate-key');
         expect(questions?.keep_observation?.type).toBe('noul');
         res.end(JSON.stringify({ answers: { keep_observation: { noul: score } } }));
@@ -957,7 +957,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
         expect(r.message).toContain('gate_model=');
         expect(r.message).toContain('prob=');
       }
-      expect(gateReceipts.some(r => r.message.includes('gate_verdict=KEEP') && r.message.includes('gate_model=openrouter/perplexity/pplx-decider-v1.3:free'))).toBe(true);
+      expect(gateReceipts.some(r => r.message.includes('gate_verdict=KEEP') && r.message.includes('gate_model=group/obs-gate'))).toBe(true);
       expect(gateReceipts.some(r => r.message.includes('gate_verdict=DROP'))).toBe(true);
       expect(gateReceipts.some(r => r.message.includes('gate_verdict=WRITER_SKIP') && r.message.includes('gate_model=none') && r.message.includes('prob=n/a'))).toBe(true);
     } finally {
