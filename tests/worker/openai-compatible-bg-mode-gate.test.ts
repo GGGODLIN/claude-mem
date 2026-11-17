@@ -1057,75 +1057,307 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   }, 10_000);
 
-  it('GPT profile leaves Stop summary and field compression on the original recipe (F5)', async () => {
-    writeFileSync(bgModePath, JSON.stringify(gptState));
+  type RequestKind = 'observation' | 'summary' | 'field-compression' | 'wrapup';
+  const requestKinds: RequestKind[] = ['observation', 'summary', 'field-compression', 'wrapup'];
+  const wrapupInput = {
+    sessionDbId: 77,
+    contentSessionId: 'content-bg-mode-77',
+    project: 'test-project',
+    platformSource: 'claude' as const,
+    summaryText: 'Finished bg-mode routing',
+  };
 
-    const gw = await startFakeGateway({
-      onChat: (req) => {
-        const msgs = (req.body.messages as Array<{ content?: string }> | undefined) ?? [];
-        const lastUser = msgs[msgs.length - 1]?.content ?? '';
-        const isCondense = typeof lastUser === 'string' && lastUser.includes('Condense the tool payload below');
-        if (isCondense) {
-          return {
-            body: {
-              model: req.body.model,
-              choices: [{ message: { role: 'assistant', content: 'condensed output summary' }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
-            },
-          };
-        }
-        if (req.body.model === 'mem-observer') {
-          return {
-            body: {
-              model: req.body.model,
-              choices: [{ message: { role: 'assistant', content: SUMMARY_XML }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 400, completion_tokens: 70, total_tokens: 470 },
-            },
-          };
-        }
-        return {
-          body: {
-            model: 'codex/gpt-6-luna:high',
-            choices: [{ message: { role: 'assistant', content: OBSERVATION_XML }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 500, completion_tokens: 80, total_tokens: 580 },
-          },
-        };
+  function requestKind(req: RecordedChatRequest): RequestKind {
+    const messages = req.body.messages as Array<{ content: string }>;
+    const prompt = messages.at(-1)!.content;
+    if (prompt.includes('Condense the tool payload below')) return 'field-compression';
+    if (prompt.includes('format as a very short bulleted list')) return 'wrapup';
+    if (prompt.includes('The ONLY accepted root tag is <summary>')) return 'summary';
+    return 'observation';
+  }
+
+  function taskReply(req: RecordedChatRequest): FakeChatReply {
+    const kind = requestKind(req);
+    return {
+      body: {
+        choices: [{ message: { role: 'assistant', content: {
+          observation: OBSERVATION_XML,
+          summary: SUMMARY_XML,
+          'field-compression': 'condensed output summary',
+          wrapup: 'Finished bg-mode routing',
+        }[kind] }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 400, completion_tokens: 70, total_tokens: 470 },
       },
-      onSystemOne: (_req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ answers: { keep_observation: { noul: 0.9 } } }));
-      },
+    };
+  }
+
+  async function runTask(kind: RequestKind, session = makeSession()) {
+    const q = makeQueueAndDb([kind === 'summary' ? makeSummary(40, 'finished work') : makeObs(41, {
+      tool_name: 'Read', tool_input: { file_path: 'huge.log' },
+      tool_response: kind === 'field-compression' ? 'line\n'.repeat(6000) : 'updated',
+    })]);
+    const provider = new OpenAICompatProvider(q.dbManager, q.sessionManager);
+    if (kind === 'wrapup') {
+      expect(await provider.formatTelegramWrapup(wrapupInput)).toBe('Finished bg-mode routing');
+    } else {
+      await provider.startSession(session);
+    }
+    return { q, session };
+  }
+
+  function wireRecipe(req: RecordedChatRequest) {
+    return {
+      body: JSON.stringify(req.body),
+      // Trace IDs are deliberately unique per independent request, unlike the route recipe.
+      headers: Object.fromEntries(Object.entries(req.headers).filter(([name]) => name !== 'x-client-request-id')),
+    };
+  }
+
+  async function runRecipes(gw: Awaited<ReturnType<typeof writerGateway>>) {
+    const before = gw.chatRequests.length;
+    await runTask('summary');
+    await runTask('field-compression');
+    await runTask('wrapup');
+    const requests = gw.chatRequests.slice(before);
+    expect(requests.map(requestKind)).toEqual(['summary', 'field-compression', 'observation', 'wrapup']);
+    return requests;
+  }
+
+  it('unregistered Stop summary and field compression keep their original recipe; registered tasks use GPT (F5)', async () => {
+    const gw = await writerGateway(taskReply);
+    try {
+      writeFileSync(bgModePath, JSON.stringify({ mode: 'quality', profile: 'current' }));
+      const original = await runRecipes(gw);
+      writeFileSync(bgModePath, JSON.stringify(gptState));
+      const observationOnly = await runRecipes(gw);
+      for (const index of [0, 1, 3]) expect(wireRecipe(observationOnly[index])).toEqual(wireRecipe(original[index]));
+      expectGpt(observationOnly[2]);
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: Object.fromEntries(
+        requestKinds.map(kind => [`claude-mem/${kind}`, { model: 'codex/gpt-6.1-sol', effort: 'high' }]),
+      ) }));
+      const registered = await runRecipes(gw);
+      registered.forEach(expectGpt);
+      expect(gw.systemOneRequests).toHaveLength(3);
+      for (const req of gw.systemOneRequests) {
+        expect(req.body.model).toBe('group/obs-gate');
+        expect(req.body.reasoning_effort).toBeUndefined();
+        expect(req.headers['x-magpie-account']).toBeUndefined();
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+
+  for (const kind of ['summary', 'field-compression', 'wrapup'] as const) {
+    it(`only the registered ${kind} changes recipe, paired with the original requests`, async () => {
+      const gw = await writerGateway(taskReply);
+      try {
+        writeFileSync(bgModePath, JSON.stringify({ mode: 'quality', profile: 'current' }));
+        const original = await runRecipes(gw);
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+          [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+        } }));
+        const qualified = await runRecipes(gw);
+        qualified.forEach((req, index) => {
+          if (requestKind(req) === kind) expectGpt(req);
+          else expect(wireRecipe(req)).toEqual(wireRecipe(original[index]));
+        });
+        if (kind === 'field-compression') {
+          const observation = qualified.find(req => requestKind(req) === 'observation')!;
+          expect(JSON.stringify(observation.body)).toContain('condensed output summary');
+        }
+      } finally {
+        await gw.close();
+      }
     });
 
+    for (const model of ['', '  ', 42, null]) {
+      it(`keeps ${kind} unchanged with invalid model ${JSON.stringify(model)}`, async () => {
+        const gw = await writerGateway(taskReply);
+        try {
+          writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+            [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+          } }));
+          await runTask(kind);
+          const qualified = gw.chatRequests.find(req => requestKind(req) === kind)!;
+          expectGpt(qualified);
+          writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {} }));
+          let before = gw.chatRequests.length;
+          await runTask(kind);
+          const original = gw.chatRequests.slice(before).find(req => requestKind(req) === kind)!;
+          writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: { [`claude-mem/${kind}`]: { model } } }));
+          before = gw.chatRequests.length;
+          await runTask(kind);
+          const unqualified = gw.chatRequests.slice(before).find(req => requestKind(req) === kind)!;
+          expect(wireRecipe(unqualified)).toEqual(wireRecipe(original));
+        } finally {
+          await gw.close();
+        }
+      });
+    }
+
+    it(`${kind} omits a mismatching account and absent effort, paired with the qualified recipe`, async () => {
+      const gw = await writerGateway(taskReply);
+      try {
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+          [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+        } }));
+        await runTask(kind);
+        expectGpt(gw.chatRequests.find(req => requestKind(req) === kind)!);
+        const before = gw.chatRequests.length;
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+          [`claude-mem/${kind}`]: { model: 'other/gpt-model' },
+        } }));
+        await runTask(kind);
+        expect(recipe(gw.chatRequests.slice(before).find(req => requestKind(req) === kind)!)).toEqual({
+          model: 'other/gpt-model', effort: undefined, account: undefined,
+        });
+      } finally {
+        await gw.close();
+      }
+    });
+
+    async function nonObservationFallback() {
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+        [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+      } }));
+      const paidSends = spyOn(PaidSendBudget.prototype, 'recordPaidSend');
+      const gw = await writerGateway(req => req.body.model === 'codex/gpt-6.1-sol' ? refusal(429) : taskReply(req));
+      try {
+        const { q, session } = await runTask(kind);
+        const requests = gw.chatRequests.filter(req => requestKind(req) === kind);
+        expect(requests.length).toBeGreaterThan(1);
+        requests.slice(0, -1).forEach(expectGpt);
+        expect(recipe(requests.at(-1)!)).toEqual({ model: 'mem-observer', effort: undefined, account: undefined });
+        expect(new Set(requests.map(req => req.headers['x-client-request-id'])).size).toBe(1);
+        expect(paidSends).toHaveBeenCalledTimes(kind === 'field-compression' ? 2 : 1);
+        if (kind !== 'wrapup') {
+          expect(session.paidSendBudget?.spentPaidSends).toBe(1);
+          expect(q.confirmCalls).toBe(1);
+        }
+        if (kind === 'summary') {
+          expect(q.storeObservations.mock.calls[0][3]).toEqual(expect.objectContaining({ request: 'Wire bg-mode and gatekeeper' }));
+          expect(q.storeObservations.mock.calls[0][7]).toBe('mem-observer');
+        }
+        if (kind === 'field-compression') {
+          expect(JSON.stringify(gw.chatRequests.at(-1)!.body)).toContain('condensed output summary');
+        }
+      } finally {
+        paidSends.mockRestore();
+        await gw.close();
+      }
+    }
+
+    it(`${kind} falls back after 429 with one paid send and the same budget`, nonObservationFallback);
+
+    for (const failure of ['500', 'unclassified 200', 'output failure'] as const) {
+      it(`${kind} does not gain a fallback on ${failure}, paired with 429 fallback`, async () => {
+        await nonObservationFallback();
+        const gw = await writerGateway(req => req.body.model !== 'codex/gpt-6.1-sol' ? taskReply(req)
+          : failure === '500' ? { status: 500, body: { error: { message: 'upstream hiccup' } } }
+          : failure === 'unclassified 200' ? { body: { error: { message: 'the stream broke upstream' } } }
+          : { body: { error: { code: 200, message: 'Unable to get json response - Expecting value' } } });
+        try {
+          const run = runTask(kind);
+          if (kind === 'field-compression' || (kind === 'summary' && failure === 'output failure')) await run;
+          else await expect(run).rejects.toThrow();
+          const requests = gw.chatRequests.filter(req => requestKind(req) === kind);
+          expect(requests).toHaveLength(1);
+          expectGpt(requests[0]);
+          if (kind === 'field-compression') {
+            expect(gw.chatRequests.map(requestKind)).toEqual(['field-compression', 'observation']);
+            expect(JSON.stringify(gw.chatRequests[1].body).includes('condensed output summary')).toBe(false);
+          }
+        } finally {
+          await gw.close();
+        }
+      });
+    }
+  }
+
+  for (const kind of ['summary', 'field-compression'] as const) {
+    it(`${kind} cancellation before GPT refusal does not send the original route`, async () => {
+      const session = makeSession();
+      const gw = await writerGateway(req => {
+        if (req.body.model !== 'codex/gpt-6.1-sol') return taskReply(req);
+        session.abortController.abort();
+        return refusal(402);
+      });
+      try {
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+          [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+        } }));
+        const run = runTask(kind, session);
+        if (kind === 'summary') await expect(run).rejects.toThrow();
+        else await run;
+        const requests = gw.chatRequests.filter(req => requestKind(req) === kind);
+        expect(requests.length).toBeGreaterThan(0);
+        requests.forEach(expectGpt);
+      } finally {
+        await gw.close();
+      }
+    });
+
+    it(`${kind} context overflow does not send the original route`, async () => {
+      const gw = await writerGateway(req => req.body.model === 'codex/gpt-6.1-sol'
+        ? { status: 400, body: { error: { message: 'context_length_exceeded' } } } : taskReply(req));
+      try {
+        writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+          [`claude-mem/${kind}`]: { model: 'codex/gpt-6.1-sol', effort: 'high' },
+        } }));
+        const { session } = await runTask(kind);
+        const requests = gw.chatRequests.filter(req => requestKind(req) === kind);
+        expect(requests).toHaveLength(1);
+        expectGpt(requests[0]);
+        if (kind === 'summary') {
+          expect(session.abortReason).toBe('overflow:recycle');
+          expect(session.paidSendBudget?.spentPaidSends).toBe(0);
+        } else {
+          expect(gw.chatRequests.map(requestKind)).toEqual(['field-compression', 'observation']);
+        }
+      } finally {
+        await gw.close();
+      }
+    });
+  }
+
+  it('summary refusal returns to the configured tier model and records the model that served it', async () => {
+    process.env.CLAUDE_MEM_TIER_ROUTING_ENABLED = 'true';
+    process.env.CLAUDE_MEM_TIER_SUMMARY_MODEL = 'original/summary-tier';
+    writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: {
+      'claude-mem/summary': { model: 'codex/gpt-6.1-sol', effort: 'high' },
+    } }));
+    let rejectGpt = false;
+    const gw = await writerGateway(req => rejectGpt && req.body.model === 'codex/gpt-6.1-sol' ? refusal(429) : taskReply(req));
     try {
-      process.env.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL = gw.baseUrl;
+      const first = await runTask('summary');
+      expectGpt(gw.chatRequests[0]);
+      expect(first.q.storeObservations.mock.calls[0][7]).toBe('codex/gpt-6.1-sol');
+      expect(first.session.lastContextTokens).toBe(400);
+      rejectGpt = true;
+      const before = gw.chatRequests.length;
+      const fallback = await runTask('summary');
+      const requests = gw.chatRequests.slice(before);
+      expect(recipe(requests.at(-1)!)).toEqual({ model: 'original/summary-tier', effort: undefined, account: undefined });
+      expect(fallback.q.storeObservations.mock.calls[0][7]).toBe('original/summary-tier');
+      expect(fallback.session.paidSendBudget?.spentPaidSends).toBe(1);
+    } finally {
+      await gw.close();
+    }
+  });
 
-      // 1) Stop <summary> alone -> 0 /v1/systemone calls, keeps mem-observer channel, stores summary
-      const qSummary = makeQueueAndDb([makeSummary(40, 'finished work')]);
-      const summarySession = makeSession();
-      await new OpenAICompatProvider(qSummary.dbManager, qSummary.sessionManager).startSession(summarySession);
-
-      expect(gw.chatRequests).toHaveLength(1);
-      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'mem-observer', effort: undefined, account: undefined });
-      expect(gw.systemOneRequests).toHaveLength(0);
-      expect(qSummary.storeObservations).toHaveBeenCalledTimes(1);
-      expect(summarySession.lastContextTokens).toBe(400);
-
-      // 2) Observation with oversized tool_response -> compressField stays on mem-observer & does not call /v1/systemone;
-      //    only the observation draft calls /v1/systemone once.
-      const qObsWithCompress = makeQueueAndDb([
-        makeObs(41, {
-          tool_name: 'Read',
-          tool_input: { file_path: 'huge.log' },
-          tool_response: 'line\n'.repeat(6000),
-        }),
-      ]);
-      await new OpenAICompatProvider(qObsWithCompress.dbManager, qObsWithCompress.sessionManager).startSession(makeSession());
-
-      expect(gw.chatRequests).toHaveLength(3); // summary + compressField + observation
-      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'mem-observer', effort: undefined, account: undefined });
-      expectGpt(gw.chatRequests[2]);
-      expect(gw.systemOneRequests).toHaveLength(1);
+  it('current profile keeps every recipe unchanged even when every task is registered', async () => {
+    const gw = await writerGateway(taskReply);
+    try {
+      writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
+      const original = await runRecipes(gw);
+      const qualified_tasks = Object.fromEntries(requestKinds.map(kind => [
+        `claude-mem/${kind}`, { model: 'codex/gpt-6.1-sol', effort: 'high' },
+      ]));
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks }));
+      (await runRecipes(gw)).forEach(expectGpt);
+      writeFileSync(bgModePath, JSON.stringify({ ...gptState, profile: 'current', qualified_tasks }));
+      expect((await runRecipes(gw)).map(wireRecipe)).toEqual(original.map(wireRecipe));
     } finally {
       await gw.close();
     }

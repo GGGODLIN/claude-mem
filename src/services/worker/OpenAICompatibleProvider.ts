@@ -31,7 +31,7 @@ import {
   isClassified,
   paidSendOutcomeOf,
 } from './provider-errors.js';
-import { paidSendBudgetForClaimedBatch, type PaidSendBudget } from './paid-send-budget.js';
+import { paidSendBudgetForClaimedBatch, PaidSendBudget } from './paid-send-budget.js';
 import {
   shouldRecycleConversation,
   describeGenerationUsage,
@@ -174,18 +174,22 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-export function parseBgWriterState(raw: string): {
+type BgWriterTask = 'claude-mem/observation' | 'claude-mem/summary' | 'claude-mem/field-compression' | 'claude-mem/wrapup';
+
+interface GptWriter {
+  model: string;
+  requestOptions: OpenAIObservationRequestOptions;
+}
+
+export function parseBgWriterState(raw: string, taskName: BgWriterTask = 'claude-mem/observation'): {
   mode: BgMode;
-  gptWriter?: {
-    model: string;
-    requestOptions: OpenAIObservationRequestOptions;
-  };
+  gptWriter?: GptWriter;
 } {
   try {
     const state: unknown = JSON.parse(raw);
     if (!isRecord(state)) return { mode: 'quality' };
     const mode = state.mode === 'eco' ? 'eco' : 'quality';
-    const task = isRecord(state.qualified_tasks) ? state.qualified_tasks['claude-mem/observation'] : undefined;
+    const task = isRecord(state.qualified_tasks) ? state.qualified_tasks[taskName] : undefined;
     if (state.profile !== 'gpt' || !isRecord(task) || !isNonEmptyString(task.model)) return { mode };
 
     const quota = state.quota_target;
@@ -208,10 +212,10 @@ export function parseBgWriterState(raw: string): {
   }
 }
 
-function readBgWriterState(): ReturnType<typeof parseBgWriterState> {
+function readBgWriterState(taskName: BgWriterTask = 'claude-mem/observation'): ReturnType<typeof parseBgWriterState> {
   const filePath = process.env.CLAUDE_MEM_BG_MODE_FILE || join(homedir(), '.magpie-machine/home/.config/magpie/bg-mode.json');
   try {
-    return parseBgWriterState(readFileSync(filePath, 'utf-8'));
+    return parseBgWriterState(readFileSync(filePath, 'utf-8'), taskName);
   } catch {
     return { mode: 'quality' };
   }
@@ -419,9 +423,10 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
    * Issue the actual HTTP request and normalize its response.
    * `perAttemptTimeoutMs` overrides the CLAUDE_MEM_LLM_TIMEOUT_MS per-attempt
    * deadline for callers racing their own, longer deadline (the field pass).
-   * `paidSendBudget` is the claimed batch's allowance (absent for an init
-   * turn, a field condensation or a wrap-up, which are not batches); its
-   * clientAttemptId goes out as `x-client-request-id`. `label` says what the
+   * `paidSendBudget` is the claimed batch's allowance, or a standalone GPT
+   * request's allowance shared with its fallback. Init and unregistered
+   * standalone calls have none. Its clientAttemptId goes out as
+   * `x-client-request-id`. `label` says what the
    * request is (ObserverRequestLabel).
    */
   protected abstract query(
@@ -433,6 +438,37 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     label?: ObserverRequestLabel,
     requestOptions?: OpenAIObservationRequestOptions,
   ): Promise<ProviderQueryResult>;
+
+  private gptWriterFor(config: TConfig, taskName: BgWriterTask): GptWriter | undefined {
+    return config.model === 'mem-observer' && this.supportsObservationRequestOptions
+      ? readBgWriterState(taskName).gptWriter : undefined;
+  }
+
+  private async queryWithGptWriter(
+    gptWriter: GptWriter | undefined,
+    queryGpt: (writer: GptWriter) => Promise<ProviderQueryResult>,
+    queryDefault: () => Promise<ProviderQueryResult>,
+    signal?: AbortSignal,
+  ): Promise<ProviderQueryResult> {
+    if (!gptWriter) return queryDefault();
+    try {
+      return await queryGpt(gptWriter);
+    } catch (err: unknown) {
+      const outcome = paidSendOutcomeOf(err);
+      // A failure inside a 200 reply has no proof of rejection unless explicitly classified.
+      const provenUnbilled = isClassified(err) && (
+        outcome === 'refused_before_work'
+        || (outcome === 'rejected' && (err.paidSendOutcome === 'rejected' || err.kind === 'quota_exhausted' || err.kind === 'auth_invalid'))
+      );
+      if (isAbortError(err) || !provenUnbilled
+        || (isClassified(err) && (err.kind === 'context_overflow' || err.code === PAID_SEND_BUDGET_EXHAUSTED_CODE))) {
+        throw err;
+      }
+      // Cancellation while GPT was in flight must not start another paid send.
+      signal?.throwIfAborted();
+      return queryDefault();
+    }
+  }
 
   /**
    * One bounded, standalone call that condenses an oversized tool payload.
@@ -448,17 +484,18 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     signal: AbortSignal,
     deadlineMs?: number,
     label?: ObserverRequestLabel,
+    sessionSignal?: AbortSignal,
   ): Promise<CompressedField | null> {
-    // The field pass races `deadlineMs` (CLAUDE_MEM_FIELD_OPTIMIZE_TIMEOUT_MS).
-    // Without it the request keeps the LLM per-attempt default, and a longer
-    // field knob would never take effect on this path (#4134).
-    const result = await this.query(
-      [{ role: 'user', content: buildFieldCompressionPrompt(text, budgetChars) }],
-      config,
-      signal,
-      deadlineMs,
-      undefined,
-      label,
+    const gptWriter = this.gptWriterFor(config, 'claude-mem/field-compression');
+    // Standalone passes have their own allowance; a rejected GPT send shares it with the original route.
+    const paidSendBudget = gptWriter ? new PaidSendBudget(0, 1) : undefined;
+    const history: ConversationMessage[] = [{ role: 'user', content: buildFieldCompressionPrompt(text, budgetChars) }];
+    // The field deadline must still override the LLM per-attempt timeout (#4134).
+    const result = await this.queryWithGptWriter(
+      gptWriter,
+      writer => this.query(history, { ...config, model: writer.model }, signal, deadlineMs, paidSendBudget, label, writer.requestOptions),
+      () => this.query(history, config, signal, deadlineMs, paidSendBudget, label),
+      sessionSignal ? AbortSignal.any([signal, sessionSignal]) : signal,
     );
     if (!result.content) return null;
     return { text: result.content, truncated: result.finishReason === 'length' || result.finishReason === 'MAX_TOKENS' };
@@ -486,13 +523,14 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
     const model = resolveSummaryTierModel(activeModelId ?? config.model, settings);
     const summaryConfig = { ...config, model, plainText: true };
-    const result = await this.query(
-      [{ role: 'user', content: buildTelegramWrapupPrompt(input.summaryText) }],
-      summaryConfig,
-      undefined,
-      undefined,
-      undefined,
-      { kind: 'telegram_wrapup', sessionId: anonymousSessionId(input.contentSessionId) },
+    const gptWriter = this.gptWriterFor(config, 'claude-mem/wrapup');
+    const paidSendBudget = gptWriter ? new PaidSendBudget(0, 1) : undefined;
+    const history: ConversationMessage[] = [{ role: 'user', content: buildTelegramWrapupPrompt(input.summaryText) }];
+    const label: ObserverRequestLabel = { kind: 'telegram_wrapup', sessionId: anonymousSessionId(input.contentSessionId) };
+    const result = await this.queryWithGptWriter(
+      gptWriter,
+      writer => this.query(history, { ...summaryConfig, model: writer.model }, undefined, undefined, paidSendBudget, label, writer.requestOptions),
+      () => this.query(history, summaryConfig, undefined, undefined, paidSendBudget, label),
     );
     if (!result.content?.trim()) {
       const error = new Error(`${this.providerName} returned no text for the Telegram wrap-up`);
@@ -799,7 +837,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     const optimized = await optimizeObservationFields(
       { toolInput: message.tool_input, toolOutput: message.tool_response },
       (text, budgetChars, signal, deadlineMs) => this.compressField(
-        text, budgetChars, config, signal, deadlineMs, generationLabel(session, 'field_compression'),
+        text, budgetChars, config, signal, deadlineMs, generationLabel(session, 'field_compression'), session.abortController.signal,
       ),
       { sessionDbId: session.sessionDbId, toolName: message.tool_name },
       fieldMaxChars,
@@ -859,32 +897,17 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       }
     };
 
-    let obsResponse: ProviderQueryResult;
-    if (gptWriter) {
-      activeWriterModel = gptWriter.model;
-      try {
-        obsResponse = await this.queryObserverTurn(
-          session, { ...config, model: gptWriter.model }, paidSendBudget, 'observation', gptWriter.requestOptions,
+    const obsResponse = await this.queryWithGptWriter(
+      gptWriter,
+      writer => {
+        activeWriterModel = writer.model;
+        return this.queryObserverTurn(
+          session, { ...config, model: writer.model }, paidSendBudget, 'observation', writer.requestOptions,
         );
-      } catch (err: unknown) {
-        const outcome = paidSendOutcomeOf(err);
-        // Only a send proven unbilled may gain another route. `rejected` as the mere default of an
-        // error nobody classified further (a failure reported inside a 200 stream) proves nothing.
-        const provenUnbilled = isClassified(err) && (
-          outcome === 'refused_before_work'
-          || (outcome === 'rejected' && (err.paidSendOutcome === 'rejected' || err.kind === 'quota_exhausted' || err.kind === 'auth_invalid'))
-        );
-        if (isAbortError(err) || !provenUnbilled
-          || (isClassified(err) && (err.kind === 'context_overflow' || err.code === PAID_SEND_BUDGET_EXHAUSTED_CODE))) {
-          throw err;
-        }
-        // A session cancelled while the GPT send was in flight must not start another paid send.
-        session.abortController.signal.throwIfAborted();
-        obsResponse = await queryDefaultWriter();
-      }
-    } else {
-      obsResponse = await queryDefaultWriter();
-    }
+      },
+      queryDefaultWriter,
+      session.abortController.signal,
+    );
 
     // Billed usage counts even when the reply came back empty.
     accumulateObserverUsage(session, obsResponse);
@@ -1001,7 +1024,20 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
         sessionId: session.sessionDbId, model: summaryModel
       });
     }
-    const summaryResponse = await this.queryObserverTurn(session, summaryConfig, paidSendBudgetForClaimedBatch(session), 'summary');
+    const paidSendBudget = paidSendBudgetForClaimedBatch(session);
+    let activeSummaryModel = summaryConfig.model;
+    const summaryResponse = await this.queryWithGptWriter(
+      this.gptWriterFor(config, 'claude-mem/summary'),
+      writer => {
+        activeSummaryModel = writer.model;
+        return this.queryObserverTurn(session, { ...summaryConfig, model: writer.model }, paidSendBudget, 'summary', writer.requestOptions);
+      },
+      () => {
+        activeSummaryModel = summaryConfig.model;
+        return this.queryObserverTurn(session, summaryConfig, paidSendBudget, 'summary');
+      },
+      session.abortController.signal,
+    );
 
     accumulateObserverUsage(session, summaryResponse);
     this.recordMeasuredContext(session, summaryResponse);
@@ -1013,7 +1049,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       session.lastFinishReason = summaryResponse.finishReason ?? null;
       await processAgentResponse(
         summaryResponse.content || '', session, this.dbManager, this.sessionManager,
-        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, summaryResponse.servedModel ?? summaryConfig.model, responseContext
+        worker, tokensUsed, originalTimestamp, this.providerName, lastCwd, summaryResponse.servedModel ?? activeSummaryModel, responseContext
       );
     } else {
       logger.warn('SDK', `Empty ${this.providerName} summary response, leaving queue intact`, {
