@@ -5,12 +5,18 @@ Claude-mem is a Claude Code plugin providing persistent memory across sessions. 
 ## Build
 
 ```bash
-npm run build                 # Build plugin/ artifacts
-# Local sync & worker restart (on this machine ~/.claude/plugins/marketplaces/thedotmack/ does not exist;
-# the active plugin & daemon run from ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/):
-rsync -a --delete --exclude=node_modules plugin/ ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/
-(cd ~/.claude/plugins/cache/thedotmack/claude-mem/<version> && bun install)
+# Lightweight worker sync (current default on this machine — avoids scripts/build-hooks.js
+# rejecting hand-edited shell templates unless --write-shell-templates is intentionally run):
+# sync only built worker-service.cjs (+ .map) into the active cache dir and restart:
+cp plugin/scripts/worker-service.cjs plugin/scripts/worker-service.cjs.map \
+  ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/scripts/
 bun ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/scripts/worker-service.cjs restart
+
+# Full plugin build & sync (only when hooks/shell templates are intentionally regenerated):
+# npm run build               # runs scripts/build-hooks.js; pass --write-shell-templates if hooks.json changed
+# rsync -a --delete --exclude=node_modules plugin/ ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/
+# (cd ~/.claude/plugins/cache/thedotmack/claude-mem/<version> && bun install)
+# bun ~/.claude/plugins/cache/thedotmack/claude-mem/<version>/scripts/worker-service.cjs restart
 ```
 
 > `npm run build-and-sync` assumes `~/.claude/plugins/marketplaces/thedotmack/` exists (`scripts/restart-marketplace-worker.cjs` exits if that path is absent).
