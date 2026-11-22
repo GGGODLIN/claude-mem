@@ -18,6 +18,20 @@ import { applySqliteConnectionPragmas } from './connection.js';
 import { projectScopeSql, scopedProjects } from './project-read-keys.js';
 import { pageMatchingRows } from './stream-rows.js';
 
+function safePositiveSqlLimit(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' && typeof value !== 'string') return fallback;
+  if (typeof value === 'string' && value.trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function safeNonNegativeSqlOffset(value: unknown): number {
+  if (typeof value !== 'number' && typeof value !== 'string') return 0;
+  if (typeof value === 'string' && value.trim() === '') return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
 /**
  * Code-point ranges of the scripts FTS5's unicode61 tokenizer cannot segment: Thai and Lao,
  * Myanmar, Khmer, Hiragana/Katakana, Bopomofo and Hangul compatibility jamo, the CJK
@@ -257,7 +271,7 @@ export class SessionSearch {
     if (filters.concepts) {
       const concepts = Array.isArray(filters.concepts) ? filters.concepts : [filters.concepts];
       const conceptConditions = concepts.map(() => {
-        return `EXISTS (SELECT 1 FROM json_each(${tableAlias}.concepts) WHERE value = ?)`;
+        return `EXISTS (SELECT 1 FROM json_each(${SessionSearch.safeJsonArray(`${tableAlias}.concepts`)}) WHERE value = ?)`;
       });
       if (conceptConditions.length > 0) {
         conditions.push(`(${conceptConditions.join(' OR ')})`);
@@ -267,18 +281,10 @@ export class SessionSearch {
 
     if (filters.files) {
       const files = Array.isArray(filters.files) ? filters.files : [filters.files];
-      const fileConditions = files.map(() => {
-        return `(
-          EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_read) WHERE value LIKE ? ESCAPE '\\')
-          OR EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_modified) WHERE value LIKE ? ESCAPE '\\')
-        )`;
-      });
-      if (fileConditions.length > 0) {
-        conditions.push(`(${fileConditions.join(' OR ')})`);
-        files.forEach(file => {
-          const literal = file.replace(/[\\%_]/g, '\\$&');
-          params.push(`%${literal}%`, `%${literal}%`);
-        });
+      const patterns = [...new Set(files.flatMap(file => SessionSearch.filePathPatterns(file, false)))];
+      if (patterns.length > 0) {
+        conditions.push(SessionSearch.jsonArrayLikeClause([`${tableAlias}.files_read`, `${tableAlias}.files_modified`], patterns.length));
+        params.push(...patterns, ...patterns);
       }
     }
 
@@ -373,13 +379,15 @@ export class SessionSearch {
   private buildOrderClause(orderBy: SearchOptions['orderBy'] = 'relevance', hasFTS: boolean = true, ftsTable: string = 'observations_fts'): string {
     switch (orderBy) {
       case 'relevance':
-        return hasFTS ? `ORDER BY ${ftsTable}.rank ASC` : 'ORDER BY o.created_at_epoch DESC';
+        return hasFTS
+          ? `ORDER BY ${ftsTable}.rank ASC, o.created_at_epoch DESC, o.id DESC`
+          : 'ORDER BY o.created_at_epoch DESC, o.id DESC';
       case 'date_desc':
-        return 'ORDER BY o.created_at_epoch DESC';
+        return 'ORDER BY o.created_at_epoch DESC, o.id DESC';
       case 'date_asc':
-        return 'ORDER BY o.created_at_epoch ASC';
+        return 'ORDER BY o.created_at_epoch ASC, o.id ASC';
       default:
-        return 'ORDER BY o.created_at_epoch DESC';
+        return 'ORDER BY o.created_at_epoch DESC, o.id DESC';
     }
   }
 
@@ -390,6 +398,8 @@ export class SessionSearch {
     limit: number,
     offset: number
   ): ObservationSearchResult[] {
+    const safeLimit = safePositiveSqlLimit(limit, 50);
+    const safeOffset = safeNonNegativeSqlOffset(offset);
     const match = SessionSearch.buildSubstringClause(query, [
       'o.title', 'o.subtitle', 'o.narrative', 'o.text', 'o.facts', 'o.concepts',
     ]);
@@ -405,7 +415,7 @@ export class SessionSearch {
       LIMIT ? OFFSET ?
     `;
 
-    return this.db.prepare(sql).all(...match.params, ...filterParams, limit, offset) as ObservationSearchResult[];
+    return this.db.prepare(sql).all(...match.params, ...filterParams, safeLimit, safeOffset) as ObservationSearchResult[];
   }
 
   private searchSessionsBySubstring(
@@ -415,6 +425,8 @@ export class SessionSearch {
     limit: number,
     offset: number
   ): SessionSummarySearchResult[] {
+    const safeLimit = safePositiveSqlLimit(limit, 50);
+    const safeOffset = safeNonNegativeSqlOffset(offset);
     const match = SessionSearch.buildSubstringClause(query, [
       's.request', 's.investigated', 's.learned', 's.completed', 's.next_steps', 's.notes',
     ]);
@@ -423,8 +435,8 @@ export class SessionSearch {
     const filterParams: any[] = [];
     const filterClause = this.buildFilterClause(filterOptions, filterParams, 's');
     const orderClause = orderBy === 'date_asc'
-      ? 'ORDER BY s.created_at_epoch ASC'
-      : 'ORDER BY s.created_at_epoch DESC';
+      ? 'ORDER BY s.created_at_epoch ASC, s.id ASC'
+      : 'ORDER BY s.created_at_epoch DESC, s.id DESC';
 
     const sql = `
       SELECT s.*, s.discovery_tokens
@@ -435,12 +447,14 @@ export class SessionSearch {
       LIMIT ? OFFSET ?
     `;
 
-    return this.db.prepare(sql).all(...match.params, ...filterParams, limit, offset) as SessionSummarySearchResult[];
+    return this.db.prepare(sql).all(...match.params, ...filterParams, safeLimit, safeOffset) as SessionSummarySearchResult[];
   }
 
   searchObservations(query: string | undefined, options: SearchOptions = {}): ObservationSearchResult[] {
     const params: any[] = [];
-    const { limit = 50, offset = 0, orderBy = 'relevance', ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'relevance', ...filters } = options;
+    const limit = safePositiveSqlLimit(rawLimit, 50);
+    const offset = safeNonNegativeSqlOffset(rawOffset);
 
     if (!query) {
       const filterClause = this.buildFilterClause(filters, params, 'o');
@@ -506,7 +520,9 @@ export class SessionSearch {
 
   searchSessions(query: string | undefined, options: SearchOptions = {}): SessionSummarySearchResult[] {
     const params: any[] = [];
-    const { limit = 50, offset = 0, orderBy = 'relevance', ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'relevance', ...filters } = options;
+    const limit = safePositiveSqlLimit(rawLimit, 50);
+    const offset = safeNonNegativeSqlOffset(rawOffset);
 
     if (!query) {
       const filterOptions = { ...filters };
@@ -519,8 +535,8 @@ export class SessionSearch {
       }
 
       const orderClause = orderBy === 'date_asc'
-        ? 'ORDER BY s.created_at_epoch ASC'
-        : 'ORDER BY s.created_at_epoch DESC';
+        ? 'ORDER BY s.created_at_epoch ASC, s.id ASC'
+        : 'ORDER BY s.created_at_epoch DESC, s.id DESC';
 
       const sql = `
         SELECT s.*, s.discovery_tokens
@@ -544,10 +560,10 @@ export class SessionSearch {
       const filterClause = this.buildFilterClause(filterOptions, params, 's');
 
       const orderClause = orderBy === 'date_asc'
-        ? 'ORDER BY s.created_at_epoch ASC'
+        ? 'ORDER BY s.created_at_epoch ASC, s.id ASC'
         : orderBy === 'date_desc'
-          ? 'ORDER BY s.created_at_epoch DESC'
-          : 'ORDER BY session_summaries_fts.rank ASC';
+          ? 'ORDER BY s.created_at_epoch DESC, s.id DESC'
+          : 'ORDER BY session_summaries_fts.rank ASC, s.created_at_epoch DESC, s.id DESC';
 
       const sql = `
         SELECT s.*, s.discovery_tokens
@@ -580,7 +596,9 @@ export class SessionSearch {
 
   findByConcept(concept: string, options: SearchOptions = {}): ObservationSearchResult[] {
     const params: any[] = [];
-    const { limit = 50, offset = 0, orderBy = 'date_desc', ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'date_desc', ...filters } = options;
+    const limit = safePositiveSqlLimit(rawLimit, 50);
+    const offset = safeNonNegativeSqlOffset(rawOffset);
 
     const conceptFilters = { ...filters, concepts: concept };
     const filterClause = this.buildFilterClause(conceptFilters, params, 'o');
@@ -633,31 +651,23 @@ export class SessionSearch {
     return checkFiles(session.files_read) || checkFiles(session.files_edited);
   }
 
+  private static safeJsonArray(column: string): string {
+    return `CASE WHEN ${column} GLOB '[' || char(32, 9, 10, 13) || '[]*' THEN CASE WHEN json_valid(${column}) THEN CASE WHEN json_type(${column}) = 'array' THEN ${column} ELSE '[]' END ELSE '[]' END ELSE '[]' END`;
+  }
+
   /**
-   * LIKE patterns that find a path in a files JSON column.
-   *
-   * Stored paths come in two forms: absolute when they come from a tool's
-   * input (Claude Code's Read/Edit/Write), project-relative when they come
-   * from the observer's output or a Codex patch, and neither records the
-   * project root. So a folder given as an absolute path also matches paths
-   * stored under any trailing part of it, which is the rule isDirectChild
-   * applies to the fetched rows. Without these anchored prefixes the
-   * project-relative rows never reached that check and folder lookups missed
-   * them.
+   * LIKE patterns look at normalized path separators. An absolute folder also
+   * needs anchored suffixes so project-relative rows reach isDirectChild.
    */
   private static filePathPatterns(filePath: string, isFolder: boolean): string[] {
     const escape = (value: string) => value.replace(/[\\%_]/g, '\\$&');
-    const patterns = [`%${escape(filePath)}%`];
-    if (!isFolder || !/^([A-Za-z]:)?[\\/]/.test(filePath)) {
-      return patterns;
-    }
-    const segments = normalizePath(filePath).split('/').filter(segment => segment.length > 0);
-    const firstRelativeSegment = /^[A-Za-z]:$/.test(segments[0] ?? '') ? 1 : 0;
-    for (let start = firstRelativeSegment; start < segments.length; start += 1) {
-      const trailing = segments.slice(start);
-      patterns.push(`${escape(trailing.join('/') + '/')}%`);
-      if (filePath.includes('\\')) {
-        patterns.push(`${escape(trailing.join('\\') + '\\')}%`);
+    const normalized = filePath.replace(/\\/g, '/');
+    const patterns = [`%${escape(normalized)}%`];
+    if (isFolder && /^([A-Za-z]:)?\//.test(normalized)) {
+      const segments = normalizePath(normalized).split('/').filter(segment => segment.length > 0);
+      const firstRelativeSegment = /^[A-Za-z]:$/.test(segments[0] ?? '') ? 1 : 0;
+      for (let start = firstRelativeSegment; start < segments.length; start += 1) {
+        patterns.push(`${escape(segments.slice(start).join('/') + '/')}%`);
       }
     }
     return patterns;
@@ -665,16 +675,19 @@ export class SessionSearch {
 
   /** Any of `columns` (JSON arrays) holds a value matching any pattern; bind every pattern once per column. */
   private static jsonArrayLikeClause(columns: string[], patternCount: number): string {
-    const anyPattern = Array.from({ length: patternCount }, () => "value LIKE ? ESCAPE '\\'").join(' OR ');
-    return `(${columns.map(column => `EXISTS (SELECT 1 FROM json_each(${column}) WHERE ${anyPattern})`).join(' OR ')})`;
+    const anyPattern = Array.from({ length: patternCount }, () => "replace(value, char(92), '/') LIKE ? ESCAPE '\\'").join(' OR ');
+    return `(${columns.map(column => `EXISTS (SELECT 1 FROM json_each(${SessionSearch.safeJsonArray(column)}) WHERE ${anyPattern})`).join(' OR ')})`;
   }
 
-  findByFile(filePath: string, options: SearchOptions = {}): {
+  /** An ID scope verifies ranked observations only, since Chroma does not rank the file's summaries. */
+  findByFile(filePath: string, options: SearchOptions = {}, observationIds?: number[]): {
     observations: ObservationSearchResult[];
     sessions: SessionSummarySearchResult[];
   } {
     const params: any[] = [];
-    const { limit = 50, offset = 0, orderBy = 'date_desc', isFolder = false, ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'date_desc', isFolder = false, ...filters } = options;
+    const limit = isFolder ? (rawLimit ?? 50) : safePositiveSqlLimit(rawLimit, 50);
+    const offset = isFolder ? (rawOffset ?? 0) : safeNonNegativeSqlOffset(rawOffset);
     // filePath is the file filter; a caller's own `files` filter is not added on top.
     delete filters.files;
 
@@ -685,12 +698,15 @@ export class SessionSearch {
     const pathPatterns = SessionSearch.filePathPatterns(filePath, isFolder);
 
     const filterClause = this.buildFilterClause(filters, params, 'o');
+    const idClause = observationIds ? `o.id IN (${observationIds.map(() => '?').join(',')})` : '';
+    if (observationIds) params.push(...observationIds);
     params.push(...pathPatterns, ...pathPatterns);
     const whereClause = [
       filterClause,
+      idClause,
       SessionSearch.jsonArrayLikeClause(['o.files_read', 'o.files_modified'], pathPatterns.length),
     ].filter(Boolean).join(' AND ');
-    const orderClause = `${this.buildOrderClause(orderBy, false)}, o.id ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
+    const orderClause = this.buildOrderClause(orderBy, false);
 
     const observationsSql = `
       SELECT o.*, o.discovery_tokens
@@ -711,6 +727,8 @@ export class SessionSearch {
           { limit, offset },
         )
       : observationStatement.all(...params) as ObservationSearchResult[];
+
+    if (observationIds) return { observations, sessions: [] };
 
     const sessionParams: any[] = [];
     const sessionFilters = { ...filters };
@@ -752,7 +770,7 @@ export class SessionSearch {
       SELECT s.*, s.discovery_tokens
       FROM session_summaries s
       WHERE ${baseConditions.join(' AND ')}
-      ORDER BY s.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}
+      ORDER BY s.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}, s.id ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}
       ${paginationSql}
     `;
 
@@ -776,7 +794,9 @@ export class SessionSearch {
     options: SearchOptions = {}
   ): ObservationSearchResult[] {
     const params: any[] = [];
-    const { limit = 50, offset = 0, orderBy = 'date_desc', ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'date_desc', ...filters } = options;
+    const limit = safePositiveSqlLimit(rawLimit, 50);
+    const offset = safeNonNegativeSqlOffset(rawOffset);
 
     const typeFilters = { ...filters, type };
     const filterClause = this.buildFilterClause(typeFilters, params, 'o');
@@ -797,7 +817,9 @@ export class SessionSearch {
 
   searchUserPrompts(query: string | undefined, options: SearchOptions = {}): UserPromptSearchResult[] {
     const params: any[] = [];
-    const { limit = 20, offset = 0, orderBy = 'relevance', ...filters } = options;
+    const { limit: rawLimit, offset: rawOffset, orderBy = 'relevance', ...filters } = options;
+    const limit = safePositiveSqlLimit(rawLimit, 20);
+    const offset = safeNonNegativeSqlOffset(rawOffset);
 
     const baseConditions: string[] = [];
     const projects = scopedProjects(filters);
@@ -833,8 +855,8 @@ export class SessionSearch {
 
       const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
       const orderClause = orderBy === 'date_asc'
-        ? 'ORDER BY up.created_at_epoch ASC'
-        : 'ORDER BY up.created_at_epoch DESC';
+        ? 'ORDER BY up.created_at_epoch ASC, up.id ASC'
+        : 'ORDER BY up.created_at_epoch DESC, up.id DESC';
 
       const sql = `
         SELECT
@@ -859,8 +881,8 @@ export class SessionSearch {
 
     const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
     const orderClause = orderBy === 'date_asc'
-      ? 'ORDER BY up.created_at_epoch ASC'
-      : 'ORDER BY up.created_at_epoch DESC';
+      ? 'ORDER BY up.created_at_epoch ASC, up.id ASC'
+      : 'ORDER BY up.created_at_epoch DESC, up.id DESC';
 
     const sql = `
       SELECT

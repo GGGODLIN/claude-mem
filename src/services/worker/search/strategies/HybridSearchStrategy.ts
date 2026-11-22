@@ -27,86 +27,59 @@ export class HybridSearchStrategy {
     sessions: SessionSummarySearchResult[];
     usedChroma: boolean;
   }> {
-    const { limit = SEARCH_CONSTANTS.DEFAULT_LIMIT, offset, project, projects, platformSource, dateRange, orderBy, isFolder } = options;
-    // The keys SearchManager scopes by, resolved once: the SQLite lookup that
-    // decides which rows match the file, the Chroma ranking and the hydration
-    // all read the same projects.
+    const { limit, offset, project, projects, platformSource, dateRange, orderBy, isFolder } = options;
     const readKeys = projectReadKeysFor(this.sessionStore, project, projects);
     const projectScope = readKeys.length > 0 ? { projects: readKeys } : {};
-    const filterOptions = { limit, offset, ...projectScope, platformSource, dateRange, orderBy, isFolder };
+    const filters = { ...projectScope, platformSource, dateRange, orderBy, isFolder };
+    const requestedLimit = Number(limit ?? SEARCH_CONSTANTS.DEFAULT_LIMIT);
+    const requestedOffset = Number(offset ?? 0);
+    if (isFolder && (!Number.isInteger(requestedLimit) || requestedLimit < 0 || !Number.isInteger(requestedOffset))) {
+      // Preserve the native folder pagination validation for invalid requests.
+      return { ...this.sessionSearch.findByFile(filePath, { ...filters, limit, offset }), usedChroma: false };
+    }
+    const pageLimit = isFolder || (typeof limit !== 'boolean' && Number.isSafeInteger(requestedLimit) && requestedLimit > 0)
+      ? requestedLimit : SEARCH_CONSTANTS.DEFAULT_LIMIT;
+    const pageOffset = typeof offset !== 'boolean' && Number.isSafeInteger(requestedOffset) ? Math.max(0, requestedOffset) : 0;
+    if (pageLimit === 0) return { observations: [], sessions: [], usedChroma: false };
+    const pageEnd = pageOffset + pageLimit;
 
     logger.debug('SEARCH', 'HybridSearchStrategy: findByFile', { filePath });
 
-    const metadataResults = this.sessionSearch.findByFile(filePath, filterOptions);
-    const sessions = metadataResults.sessions;
-
+    const metadataResults = this.sessionSearch.findByFile(filePath, { ...filters, limit: pageEnd, offset: 0 });
+    const sessions = metadataResults.sessions.slice(pageOffset, pageEnd);
     if (metadataResults.observations.length === 0) {
       return { observations: [], sessions, usedChroma: false };
     }
 
-    const ids = metadataResults.observations.map(obs => obs.id);
-
-    return await this.rankAndHydrateForFile(filePath, ids, metadataResults.observations, { limit, readKeys, platformSource, orderBy }, sessions);
-  }
-
-  private async rankAndHydrateForFile(
-    filePath: string,
-    metadataIds: number[],
-    fallbackObservations: ObservationSearchResult[],
-    options: { limit: number; readKeys: string[]; platformSource?: string; orderBy?: StrategySearchOptions['orderBy'] },
-    sessions: SessionSummarySearchResult[]
-  ): Promise<{ observations: ObservationSearchResult[]; sessions: SessionSummarySearchResult[]; usedChroma: boolean }> {
     const chromaResults = await this.chromaSync.queryChroma(
       filePath,
-      Math.min(metadataIds.length, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE),
-      // Ranks only: the file matches came from SQLite, scoped by the same keys.
-      this.buildObservationWhereFilter(options.readKeys, options.platformSource)
+      SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
+      this.buildObservationWhereFilter(readKeys, platformSource)
     );
 
-    const rankedIds = this.intersectWithRanking(metadataIds, chromaResults.ids);
-
-    if (rankedIds.length > 0) {
-      for (const id of metadataIds) {
-        if (!rankedIds.includes(id)) {
-          rankedIds.push(id);
-        }
-      }
-
-      const dateOrder = options.orderBy === 'date_asc' || options.orderBy === 'date_desc' ? options.orderBy : undefined;
-      const observations = this.sessionStore.getObservationsByIds(rankedIds, {
-        orderBy: dateOrder ?? 'relevance',
-        limit: options.limit,
-        ...(options.readKeys.length > 0 ? { projects: options.readKeys } : {}),
-        platformSource: options.platformSource
-      });
-      if (!dateOrder) {
-        observations.sort((a, b) => rankedIds.indexOf(a.id) - rankedIds.indexOf(b.id));
-      }
-
-      return { observations, sessions, usedChroma: true };
+    // An exact match outside the SQLite date prefix can rank on the first page.
+    const matchingRanked = chromaResults.ids.length > 0
+      ? this.sessionSearch.findByFile(filePath, { ...filters, limit: chromaResults.ids.length }, chromaResults.ids).observations
+      : [];
+    const rankedIds = this.intersectWithRanking(matchingRanked.map(row => row.id), chromaResults.ids);
+    if (rankedIds.length === 0) {
+      return { observations: metadataResults.observations.slice(pageOffset, pageEnd), sessions, usedChroma: false };
     }
 
-    return {
-      observations: this.sortMetadataFallback(fallbackObservations, options.limit, options.orderBy),
-      sessions,
-      usedChroma: false
-    };
-  }
-
-  private sortMetadataFallback(
-    observations: ObservationSearchResult[],
-    limit: number,
-    orderBy: StrategySearchOptions['orderBy'] = 'date_desc'
-  ): ObservationSearchResult[] {
-    const sorted = [...observations].sort((a, b) => {
-      const epochDelta = a.created_at_epoch - b.created_at_epoch;
-      if (epochDelta !== 0) {
-        return orderBy === 'date_asc' ? epochDelta : -epochDelta;
-      }
-      const idDelta = a.id - b.id;
-      return orderBy === 'date_asc' ? idDelta : -idDelta;
+    const dateOrder = orderBy === 'date_asc' || orderBy === 'date_desc' ? orderBy : undefined;
+    const metadataIds = metadataResults.observations.map(row => row.id);
+    const orderedIds = dateOrder ? metadataIds : [...rankedIds, ...metadataIds.filter(id => !rankedIds.includes(id))];
+    const pageIds = orderedIds.slice(pageOffset, pageEnd);
+    const observations = this.sessionStore.getObservationsByIds(pageIds, {
+      orderBy: dateOrder ?? 'relevance',
+      limit: pageLimit,
+      ...projectScope,
+      platformSource
     });
-    return sorted.slice(0, limit);
+    if (!dateOrder) {
+      observations.sort((a, b) => pageIds.indexOf(a.id) - pageIds.indexOf(b.id));
+    }
+    return { observations, sessions, usedChroma: true };
   }
 
   private buildObservationWhereFilter(readKeys: string[], platformSource?: string): Record<string, any> {

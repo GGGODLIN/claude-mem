@@ -251,11 +251,17 @@ export class SearchRoutes extends BaseRouteHandler {
     const formatter = this.searchManager.getFormatter();
     const query = this.searchArgsFromRequest(req);
     const rawFilePath = query.filePath ?? query.files;
-    const filePath = Array.isArray(rawFilePath)
+    const rawCandidate = Array.isArray(rawFilePath)
       ? rawFilePath[0]
       : (query.filePath === undefined && typeof rawFilePath === 'string' && rawFilePath.includes(','))
         ? rawFilePath.split(',')[0].trim()
         : rawFilePath;
+    const filePath = typeof rawCandidate === 'string' ? rawCandidate.trim() : '';
+
+    if (!filePath) {
+      this.badRequest(res, 'filePath parameter is required');
+      return;
+    }
 
     const { observations, sessions } = await orchestrator.findByFile(filePath, query);
     const totalResults = observations.length + sessions.length;
@@ -290,8 +296,13 @@ export class SearchRoutes extends BaseRouteHandler {
       }))
     ];
 
-    combined.sort((a, b) => b.epoch - a.epoch);
-    const resultsByDate = groupByDate(combined, item => item.created_at, { order: 'desc' });
+    const isAsc = query.orderBy === 'date_asc';
+    combined.sort((a, b) => {
+      const epochDiff = isAsc ? a.epoch - b.epoch : b.epoch - a.epoch;
+      if (epochDiff !== 0) return epochDiff;
+      return isAsc ? a.data.id - b.data.id : b.data.id - a.data.id;
+    });
+    const resultsByDate = groupByDate(combined, item => item.created_at, { order: isAsc ? 'asc' : 'desc' });
 
     const lines: string[] = [];
     lines.push(`Found ${totalResults} result(s) for file "${filePath}"`);

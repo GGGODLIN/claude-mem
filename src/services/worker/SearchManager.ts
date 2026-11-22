@@ -17,12 +17,24 @@ import {
   SearchOrchestrator,
   SEARCH_CONSTANTS
 } from './search/index.js';
-import type { SearchResults, StrategySearchResult, DateRange } from './search/index.js';
+import type { SearchResults, StrategySearchResult, DateRange, SearchCategory } from './search/index.js';
 import { assertSearchHasQueryOrFilter } from './search/SearchOrchestrator.js';
 import { isCategoryRequested, buildCategoryWhereFilter } from './search/types.js';
 import { ResultFormatter } from './search/ResultFormatter.js';
 import { ChromaUnavailableError } from './search/errors.js';
 import { buildProjectWhereFilter, projectReadKeysFor } from './search/project-where-filter.js';
+
+function safePositiveSearchLimit(value: unknown, fallback: number): number {
+  if (typeof value === 'boolean') return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function safeNonNegativeSearchOffset(value: unknown): number {
+  if (typeof value === 'boolean') return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
 
 /**
  * Telemetry envelope for search_performed (see docs/public/telemetry.mdx).
@@ -402,17 +414,22 @@ export class SearchManager {
       searchSessions: boolean;
       searchPrompts: boolean;
     }
-  ): Promise<SearchResults> {
+  ): Promise<{ results: SearchResults; hasHitsBeforeOffset: Partial<Record<SearchCategory, boolean>> }> {
     const { obs_type, concepts, files, searchObservations, searchSessions, searchPrompts } = scope;
     let observations: ObservationSearchResult[] = [];
     let sessions: SessionSummarySearchResult[] = [];
     let prompts: UserPromptSearchResult[] = [];
+    const hasHitsBeforeOffset: Partial<Record<SearchCategory, boolean>> = {};
 
     // Hydration applies `limit`, so a requested date order has to reach it; otherwise the wrong
     // end of the candidates is kept (date_asc hydrated newest-first keeps the newest rows).
     const requestedDateOrder: 'date_desc' | 'date_asc' | undefined =
       options.orderBy === 'date_desc' || options.orderBy === 'date_asc' ? options.orderBy : undefined;
-    const chromaResults = await this.queryChroma(query, SEARCH_CONSTANTS.CHROMA_BATCH_SIZE, whereFilter);
+    const hydrationOrder: 'date_desc' | 'date_asc' | 'relevance' = requestedDateOrder ?? 'relevance';
+    const safeLimit = safePositiveSearchLimit(options.limit, SEARCH_CONSTANTS.DEFAULT_LIMIT);
+    const safeOffset = safeNonNegativeSearchOffset(options.offset);
+    const batchSize = Math.max(SEARCH_CONSTANTS.CHROMA_BATCH_SIZE, safeOffset + safeLimit);
+    const chromaResults = await this.queryChroma(query, batchSize, whereFilter);
     logger.debug('SEARCH', 'ChromaDB returned semantic matches', { matchCount: chromaResults.ids.length });
 
     if (chromaResults.ids.length > 0) {
@@ -457,33 +474,63 @@ export class SearchManager {
       }
 
       if (obsIds.length > 0) {
-        const obsOptions = { ...options, type: obs_type, concepts, files, orderBy: requestedDateOrder ?? 'relevance' };
+        const obsOptions = {
+          ...options,
+          type: obs_type,
+          concepts,
+          files,
+          limit: safeLimit,
+          orderBy: hydrationOrder,
+          ...(safeOffset > 0 ? { offset: safeOffset } : {}),
+        };
         observations = this.sessionStore.getObservationsByIds(obsIds, obsOptions);
         if (!requestedDateOrder) {
           observations.sort((a, b) => obsIds.indexOf(a.id) - obsIds.indexOf(b.id));
         }
+        if (observations.length === 0 && safeOffset > 0) {
+          const unpaged = this.sessionStore.getObservationsByIds(obsIds, { ...obsOptions, limit: 1, offset: 0 });
+          if (unpaged.length > 0) {
+            hasHitsBeforeOffset.observations = true;
+          }
+        }
       }
       if (sessionIds.length > 0) {
-        sessions = this.sessionStore.getSessionSummariesByIds(sessionIds, {
-          orderBy: requestedDateOrder ?? 'date_desc',
-          limit: options.limit,
+        const sessionOptions = {
+          orderBy: hydrationOrder,
+          limit: safeLimit,
+          ...(safeOffset > 0 ? { offset: safeOffset } : {}),
           project: options.project,
           projects: options.projects,
           platformSource: options.platformSource
-        });
+        };
+        sessions = this.sessionStore.getSessionSummariesByIds(sessionIds, sessionOptions);
+        if (sessions.length === 0 && safeOffset > 0) {
+          const unpaged = this.sessionStore.getSessionSummariesByIds(sessionIds, { ...sessionOptions, limit: 1, offset: 0 });
+          if (unpaged.length > 0) {
+            hasHitsBeforeOffset.sessions = true;
+          }
+        }
       }
       if (promptIds.length > 0) {
-        prompts = this.sessionStore.getUserPromptsByIds(promptIds, {
-          orderBy: requestedDateOrder ?? 'date_desc',
-          limit: options.limit,
+        const promptOptions = {
+          orderBy: hydrationOrder,
+          limit: safeLimit,
+          ...(safeOffset > 0 ? { offset: safeOffset } : {}),
           project: options.project,
           projects: options.projects,
           platformSource: options.platformSource
-        });
+        };
+        prompts = this.sessionStore.getUserPromptsByIds(promptIds, promptOptions);
+        if (prompts.length === 0 && safeOffset > 0) {
+          const unpaged = this.sessionStore.getUserPromptsByIds(promptIds, { ...promptOptions, limit: 1, offset: 0 });
+          if (unpaged.length > 0) {
+            hasHitsBeforeOffset.prompts = true;
+          }
+        }
       }
     }
 
-    return { observations, sessions, prompts };
+    return { results: { observations, sessions, prompts }, hasHitsBeforeOffset };
   }
 
   /**
@@ -500,26 +547,33 @@ export class SearchManager {
     options: any,
     scope: { searchObservations: boolean; searchSessions: boolean; searchPrompts: boolean }
   ): SearchResults {
-    const limit = options.limit || SEARCH_CONSTANTS.DEFAULT_LIMIT;
-    const byDate = (a: { created_at_epoch: number }, b: { created_at_epoch: number }) =>
-      dateOrder === 'date_desc' ? b.created_at_epoch - a.created_at_epoch : a.created_at_epoch - b.created_at_epoch;
+    const safeLimit = safePositiveSearchLimit(options.limit, SEARCH_CONSTANTS.DEFAULT_LIMIT);
+    const safeOffset = safeNonNegativeSearchOffset(options.offset);
+    const candidateLimit = safeOffset + safeLimit;
+    const byDate = (a: { id: number; created_at_epoch: number }, b: { id: number; created_at_epoch: number }) => {
+      const epochDiff = dateOrder === 'date_desc'
+        ? b.created_at_epoch - a.created_at_epoch
+        : a.created_at_epoch - b.created_at_epoch;
+      if (epochDiff !== 0) return epochDiff;
+      return dateOrder === 'date_desc' ? b.id - a.id : a.id - b.id;
+    };
     const mergeByDate = <T extends { id: number; created_at_epoch: number }>(chromaRows: T[], keywordRows: T[]): T[] => {
       const rowsById = new Map<number, T>();
       for (const row of [...chromaRows, ...keywordRows]) {
         if (!rowsById.has(row.id)) rowsById.set(row.id, row);
       }
-      return Array.from(rowsById.values()).sort(byDate).slice(0, limit);
+      return Array.from(rowsById.values()).sort(byDate).slice(safeOffset, candidateLimit);
     };
 
     return {
       observations: scope.searchObservations
-        ? mergeByDate(chromaResults.observations, this.sessionSearch.searchObservations(query, { ...observationOptions, orderBy: dateOrder, limit }))
+        ? mergeByDate(chromaResults.observations, this.sessionSearch.searchObservations(query, { ...observationOptions, orderBy: dateOrder, limit: candidateLimit, offset: 0 }))
         : chromaResults.observations,
       sessions: scope.searchSessions
-        ? mergeByDate(chromaResults.sessions, this.sessionSearch.searchSessions(query, { ...options, orderBy: dateOrder, limit }))
+        ? mergeByDate(chromaResults.sessions, this.sessionSearch.searchSessions(query, { ...options, orderBy: dateOrder, limit: candidateLimit, offset: 0 }))
         : chromaResults.sessions,
       prompts: scope.searchPrompts
-        ? mergeByDate(chromaResults.prompts, this.sessionSearch.searchUserPrompts(query, { ...options, orderBy: dateOrder, limit }))
+        ? mergeByDate(chromaResults.prompts, this.sessionSearch.searchUserPrompts(query, { ...options, orderBy: dateOrder, limit: candidateLimit, offset: 0 }))
         : chromaResults.prompts,
     };
   }
@@ -527,9 +581,10 @@ export class SearchManager {
   async search(args: any, telemetryOut?: SearchTelemetryEnvelope): Promise<any> {
     const normalized = this.normalizeParams(args);
     const { query, type, obs_type, concepts, files, format, ...options } = normalized;
+    const requestedProjects = options.projects;
     // Gate P2-5: every key the requested projects are stored under, so a
     // checkout's search reaches what it wrote before a re-key. The SQLite paths
-    // receive the same list (scopedProjects prefers `projects` over `project`).
+    // receive the same list (scopedProjects merges `project` and `projects`).
     const projectReadKeys = projectReadKeysFor(this.sessionStore, options.project, options.projects);
     if (projectReadKeys.length > 0) {
       options.projects = projectReadKeys;
@@ -602,14 +657,23 @@ export class SearchManager {
           ? whereFilters[0]
           : { $and: whereFilters };
 
+      const isDateOrdered = options.orderBy === 'date_desc' || options.orderBy === 'date_asc';
+      const safeLimit = safePositiveSearchLimit(options.limit, SEARCH_CONSTANTS.DEFAULT_LIMIT);
+      const safeOffset = safeNonNegativeSearchOffset(options.offset);
+      const chromaOptions = isDateOrdered && safeOffset > 0
+        ? { ...options, offset: 0, limit: safeOffset + safeLimit }
+        : options;
+
       try {
-        const chromaResults = await this.performChromaSemanticSearch(query, whereFilter, options, { obs_type: effectiveObsType, concepts, files, searchObservations, searchSessions, searchPrompts });
+        const chromaSearch = await this.performChromaSemanticSearch(query, whereFilter, chromaOptions, { obs_type: effectiveObsType, concepts, files, searchObservations, searchSessions, searchPrompts });
         chromaSucceeded = true;
         // Same fallback policy as the orchestrator pipeline: SQLite refills every requested
         // category Chroma left empty, or answers alone when Chroma left them all empty.
+        const { projects: _expandedProjects, ...supplementBaseOptions } = chromaOptions;
         const supplemented = await this.orchestrator.supplementEmptyCategories(
           {
-            ...options,
+            ...supplementBaseOptions,
+            ...(requestedProjects !== undefined ? { projects: requestedProjects } : {}),
             query,
             searchType: category ?? 'all',
             obsType: effectiveObsType,
@@ -617,7 +681,12 @@ export class SearchManager {
             files,
             orderBy: options.orderBy ?? 'relevance',
           },
-          { results: chromaResults, usedChroma: true, strategy: 'chroma' }
+          {
+            results: chromaSearch.results,
+            usedChroma: true,
+            strategy: 'chroma',
+            ...(Object.keys(chromaSearch.hasHitsBeforeOffset).length > 0 ? { hasHitsBeforeOffset: chromaSearch.hasHitsBeforeOffset } : {}),
+          }
         );
         ({ observations, sessions, prompts } = supplemented.results);
         chromaSupplementStrategy = supplemented.strategy;
@@ -775,12 +844,12 @@ export class SearchManager {
     ];
 
     if (options.orderBy === 'date_desc') {
-      allResults.sort((a, b) => b.epoch - a.epoch);
+      allResults.sort((a, b) => (b.epoch - a.epoch) || (b.data.id - a.data.id));
     } else if (options.orderBy === 'date_asc') {
-      allResults.sort((a, b) => a.epoch - b.epoch);
+      allResults.sort((a, b) => (a.epoch - b.epoch) || (a.data.id - b.data.id));
     }
 
-    const limitedResults = allResults.slice(0, options.limit || 20);
+    const limitedResults = allResults.slice(0, safePositiveSearchLimit(options.limit, SEARCH_CONSTANTS.DEFAULT_LIMIT));
 
     const cwd = process.cwd();
     const resultsByDate = groupByDate(

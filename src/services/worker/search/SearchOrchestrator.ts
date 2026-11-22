@@ -37,6 +37,7 @@ function copyCategory<K extends SearchCategory>(
 interface SearchRequestInput {
   query?: unknown;
   project?: unknown;
+  projects?: unknown;
   platformSource?: unknown;
   dateRange?: { start?: unknown; end?: unknown } | null;
   obsType?: unknown;
@@ -60,7 +61,7 @@ function isPresent(value: unknown): boolean {
 export function assertSearchHasQueryOrFilter(input: SearchRequestInput): void {
   const hasDateRange = !!input.dateRange && (isPresent(input.dateRange.start) || isPresent(input.dateRange.end));
   const hasFilter = hasDateRange
-    || [input.project, input.platformSource, input.obsType, input.concepts, input.files].some(isPresent);
+    || [input.project, input.projects, input.platformSource, input.obsType, input.concepts, input.files].some(isPresent);
   if (!isPresent(input.query) && !hasFilter) {
     throw new AppError('Either query or filters required for search', 400, 'INVALID_SEARCH_REQUEST');
   }
@@ -91,12 +92,20 @@ export class SearchOrchestrator {
     return await this.executeWithFallback(options);
   }
 
+  private sqliteSearchOptions(options: StrategySearchOptions): StrategySearchOptions {
+    const readKeys = projectReadKeysFor(this.sessionStore, options.project, options.projects);
+    return {
+      ...options,
+      projects: readKeys.length > 0 ? readKeys : undefined,
+    };
+  }
+
   private async executeWithFallback(
     options: NormalizedParams
   ): Promise<StrategySearchResult> {
     if (!options.query) {
       logger.debug('SEARCH', 'Orchestrator: Filter-only query, using SQLite', {});
-      return await this.sqliteStrategy.search(options);
+      return await this.sqliteStrategy.search(this.sqliteSearchOptions(options));
     }
 
     if (this.chromaStrategy) {
@@ -119,7 +128,7 @@ export class SearchOrchestrator {
     // instead of an empty result that reads as "no matches" (#4284). Knowledge
     // corpus builds with a query filter reach this path.
     logger.debug('SEARCH', 'Orchestrator: Chroma not configured, falling back to SQLite', {});
-    return await this.sqliteStrategy.search(options);
+    return await this.sqliteStrategy.search(this.sqliteSearchOptions(options));
   }
 
   /**
@@ -145,19 +154,28 @@ export class SearchOrchestrator {
       return chromaResult;
     }
 
-    if (emptyCategories.length === requestedCategories.length) {
+    const categoriesToSupplement = emptyCategories
+      .filter(category => !chromaResult.hasHitsBeforeOffset?.[category]);
+
+    if (categoriesToSupplement.length === 0) {
+      return chromaResult;
+    }
+
+    const sqliteOptions = this.sqliteSearchOptions(options);
+
+    if (categoriesToSupplement.length === requestedCategories.length) {
       logger.debug('SEARCH', 'Orchestrator: Chroma returned zero matches for every requested category; falling back to SQLite', {});
-      return await this.sqliteStrategy.search(options);
+      return await this.sqliteStrategy.search(sqliteOptions);
     }
 
     logger.debug('SEARCH', 'Orchestrator: Chroma returned zero matches for some categories; supplementing from SQLite', {
-      categories: emptyCategories.join(',')
+      categories: categoriesToSupplement.join(',')
     });
 
     const mergedResults: SearchResults = { ...chromaResult.results };
     let supplemented = false;
-    for (const category of emptyCategories) {
-      const sqliteResult = await this.sqliteStrategy.search({ ...options, searchType: category });
+    for (const category of categoriesToSupplement) {
+      const sqliteResult = await this.sqliteStrategy.search({ ...sqliteOptions, searchType: category });
       if (sqliteResult.results[category].length > 0) {
         copyCategory(mergedResults, sqliteResult.results, category);
         supplemented = true;
@@ -232,6 +250,12 @@ export class SearchOrchestrator {
     delete normalized.date_end;
     delete normalized.date_from;
     delete normalized.date_to;
+
+    if (normalized.isFolder === 'true') {
+      normalized.isFolder = true;
+    } else if (normalized.isFolder === 'false') {
+      normalized.isFolder = false;
+    }
 
     const rawPlatformSource = normalized.platformSource ?? normalized.platform_source;
     if (typeof rawPlatformSource === 'string' && rawPlatformSource.trim()) {

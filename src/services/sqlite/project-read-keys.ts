@@ -1,13 +1,18 @@
 import type { Database } from 'bun:sqlite';
 
 /**
- * The projects a read is scoped to: the explicit list, else the single project.
+ * The projects a read is scoped to: both the single project and the explicit
+ * list, merged and deduplicated.
  * A checkout reads several keys (its current one, plus the ones it wrote under
  * before a git-remote slug, an environment or a marker re-keyed it), so reads
  * take a list (gate P2-5).
  */
 export function scopedProjects(filters: { project?: string; projects?: string[] }): string[] {
-  const requested = filters.projects?.length ? filters.projects : filters.project ? [filters.project] : [];
+  const listed = Array.isArray(filters.projects) ? filters.projects : [];
+  const requested = [
+    ...(typeof filters.project === 'string' ? [filters.project] : []),
+    ...listed,
+  ];
   return [...new Set(requested.map(project => project.trim()).filter(Boolean))];
 }
 

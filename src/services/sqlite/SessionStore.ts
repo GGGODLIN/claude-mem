@@ -188,6 +188,16 @@ function positiveIntegerRowLimit(limit: unknown): number | undefined {
   return Number.isSafeInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined;
 }
 
+function nonNegativeIntegerRowOffset(offset: unknown): number {
+  if (typeof offset === 'boolean') return 0;
+  const parsedOffset = Number(offset);
+  return Number.isSafeInteger(parsedOffset) && parsedOffset > 0 ? parsedOffset : 0;
+}
+
+function safeJsonArray(column: string): string {
+  return `CASE WHEN ${column} GLOB '[' || char(32, 9, 10, 13) || '[]*' THEN CASE WHEN json_valid(${column}) THEN CASE WHEN json_type(${column}) = 'array' THEN ${column} ELSE '[]' END ELSE '[]' END ELSE '[]' END`;
+}
+
 export class SessionStore {
   public db: Database;
   private readonly syncOpsEnabled: boolean;
@@ -3063,17 +3073,20 @@ export class SessionStore {
 
   getObservationsByIds(
     ids: number[],
-    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; project?: string; projects?: string[]; platformSource?: string; type?: string | string[]; concepts?: string | string[]; files?: string | string[] } = {}
+    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; offset?: number; project?: string; projects?: string[]; platformSource?: string; type?: string | string[]; concepts?: string | string[]; files?: string | string[] } = {}
   ): ObservationSearchResult[] {
     if (ids.length === 0) return [];
 
     const { orderBy = 'date_desc', platformSource, type, concepts, files } = options;
     const limit = positiveIntegerRowLimit(options.limit);
+    const offset = nonNegativeIntegerRowOffset(options.offset);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
     const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const orderClause = preserveIdOrder ? '' : `ORDER BY o.created_at_epoch ${direction}, o.id ${direction}`;
-    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
+    const paginationClause = !preserveIdOrder
+      ? (limit ? (offset > 0 ? 'LIMIT ? OFFSET ?' : 'LIMIT ?') : (offset > 0 ? 'LIMIT -1 OFFSET ?' : ''))
+      : '';
 
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
@@ -3104,7 +3117,7 @@ export class SessionStore {
     if (concepts) {
       const conceptsList = Array.isArray(concepts) ? concepts : [concepts];
       const conceptConditions = conceptsList.map(() =>
-        'EXISTS (SELECT 1 FROM json_each(o.concepts) WHERE value = ?)'
+        `EXISTS (SELECT 1 FROM json_each(${safeJsonArray('o.concepts')}) WHERE value = ?)`
       );
       params.push(...conceptsList);
       additionalConditions.push(`(${conceptConditions.join(' OR ')})`);
@@ -3112,21 +3125,24 @@ export class SessionStore {
 
     if (files) {
       const filesList = Array.isArray(files) ? files : [files];
-      const fileConditions = filesList.map(() => {
-        return "(EXISTS (SELECT 1 FROM json_each(o.files_read) WHERE value LIKE ? ESCAPE '\\') OR EXISTS (SELECT 1 FROM json_each(o.files_modified) WHERE value LIKE ? ESCAPE '\\'))";
-      });
-      filesList.forEach(file => {
-        // The hydration filter receives literal file paths, like SQLite search.
-        const literal = file.replace(/[\\%_]/g, '\\$&');
-        params.push(`%${literal}%`, `%${literal}%`);
-      });
-      additionalConditions.push(`(${fileConditions.join(' OR ')})`);
+      const normalizedFiles = new Set(filesList.map(file => file.replace(/\\/g, '/')));
+      const patterns = Array.from(normalizedFiles, file => `%${file.replace(/[\\%_]/g, '\\$&')}%`);
+      if (patterns.length > 0) {
+        const anyPattern = patterns.map(() => "replace(value, char(92), '/') LIKE ? ESCAPE '\\'").join(' OR ');
+        additionalConditions.push(
+          `(EXISTS (SELECT 1 FROM json_each(${safeJsonArray('o.files_read')}) WHERE ${anyPattern}) OR EXISTS (SELECT 1 FROM json_each(${safeJsonArray('o.files_modified')}) WHERE ${anyPattern}))`
+        );
+        params.push(...patterns, ...patterns);
+      }
     }
 
     const whereClause = additionalConditions.length > 0
       ? `WHERE o.id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
       : `WHERE o.id IN (${placeholders})`;
-    if (limitClause) params.push(limit);
+    if (!preserveIdOrder) {
+      if (limit) params.push(limit);
+      if (offset > 0) params.push(offset);
+    }
 
     const stmt = this.db.prepare(`
       SELECT o.*
@@ -3134,7 +3150,7 @@ export class SessionStore {
       LEFT JOIN sdk_sessions s ON s.memory_session_id = o.memory_session_id
       ${whereClause}
       ${orderClause}
-      ${limitClause}
+      ${paginationClause}
     `);
 
     const rows = stmt.all(...params) as ObservationSearchResult[];
@@ -3142,7 +3158,7 @@ export class SessionStore {
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
     const ordered = ids.map(id => rowMap.get(id)).filter((r): r is ObservationSearchResult => !!r);
-    return limit ? ordered.slice(0, limit) : ordered;
+    return ordered.slice(offset, limit ? offset + limit : undefined);
   }
 
   getSummaryForSession(memorySessionId: string, platformSource?: string): SummaryDetailRow | null {
@@ -3988,16 +4004,20 @@ export class SessionStore {
 
   getSessionSummariesByIds(
     ids: number[],
-    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; project?: string; projects?: string[]; platformSource?: string } = {}
+    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; offset?: number; project?: string; projects?: string[]; platformSource?: string } = {}
   ): SessionSummarySearchResult[] {
     if (ids.length === 0) return [];
 
     const { orderBy = 'date_desc', platformSource } = options;
     const limit = positiveIntegerRowLimit(options.limit);
+    const offset = nonNegativeIntegerRowOffset(options.offset);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
-    const orderClause = preserveIdOrder ? '' : `ORDER BY ss.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
-    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
+    const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
+    const orderClause = preserveIdOrder ? '' : `ORDER BY ss.created_at_epoch ${direction}, ss.id ${direction}`;
+    const paginationClause = !preserveIdOrder
+      ? (limit ? (offset > 0 ? 'LIMIT ? OFFSET ?' : 'LIMIT ?') : (offset > 0 ? 'LIMIT -1 OFFSET ?' : ''))
+      : '';
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
     const additionalConditions: string[] = [];
@@ -4016,7 +4036,10 @@ export class SessionStore {
     const additionalFilter = additionalConditions.length > 0
       ? `AND ${additionalConditions.join(' AND ')}`
       : '';
-    if (limitClause) params.push(limit);
+    if (!preserveIdOrder) {
+      if (limit) params.push(limit);
+      if (offset > 0) params.push(offset);
+    }
 
     const stmt = this.db.prepare(`
       SELECT ss.*
@@ -4024,7 +4047,7 @@ export class SessionStore {
       LEFT JOIN sdk_sessions s ON s.memory_session_id = ss.memory_session_id
       WHERE ss.id IN (${placeholders}) ${additionalFilter}
       ${orderClause}
-      ${limitClause}
+      ${paginationClause}
     `);
 
     const rows = stmt.all(...params) as SessionSummarySearchResult[];
@@ -4032,21 +4055,25 @@ export class SessionStore {
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
     const ordered = ids.map(id => rowMap.get(id)).filter((r): r is SessionSummarySearchResult => !!r);
-    return limit ? ordered.slice(0, limit) : ordered;
+    return ordered.slice(offset, limit ? offset + limit : undefined);
   }
 
   getUserPromptsByIds(
     ids: number[],
-    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; project?: string; projects?: string[]; platformSource?: string } = {}
+    options: { orderBy?: 'date_desc' | 'date_asc' | 'relevance'; limit?: number; offset?: number; project?: string; projects?: string[]; platformSource?: string } = {}
   ): UserPromptRecord[] {
     if (ids.length === 0) return [];
 
     const { orderBy = 'date_desc', platformSource } = options;
     const limit = positiveIntegerRowLimit(options.limit);
+    const offset = nonNegativeIntegerRowOffset(options.offset);
     const projects = scopedProjects(options);
     const preserveIdOrder = orderBy === 'relevance';
-    const orderClause = preserveIdOrder ? '' : `ORDER BY up.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
-    const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
+    const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
+    const orderClause = preserveIdOrder ? '' : `ORDER BY up.created_at_epoch ${direction}, up.id ${direction}`;
+    const paginationClause = !preserveIdOrder
+      ? (limit ? (offset > 0 ? 'LIMIT ? OFFSET ?' : 'LIMIT ?') : (offset > 0 ? 'LIMIT -1 OFFSET ?' : ''))
+      : '';
     const placeholders = ids.map(() => '?').join(',');
     const params: any[] = [...ids];
     const additionalConditions: string[] = [];
@@ -4065,7 +4092,10 @@ export class SessionStore {
     const additionalFilter = additionalConditions.length > 0
       ? `AND ${additionalConditions.join(' AND ')}`
       : '';
-    if (limitClause) params.push(limit);
+    if (!preserveIdOrder) {
+      if (limit) params.push(limit);
+      if (offset > 0) params.push(offset);
+    }
 
     const stmt = this.db.prepare(`
       SELECT
@@ -4077,7 +4107,7 @@ export class SessionStore {
       JOIN sdk_sessions s ON up.session_db_id = s.id
       WHERE up.id IN (${placeholders}) ${additionalFilter}
       ${orderClause}
-      ${limitClause}
+      ${paginationClause}
     `);
 
     const rows = stmt.all(...params) as UserPromptRecord[];
@@ -4085,7 +4115,7 @@ export class SessionStore {
 
     const rowMap = new Map(rows.map(r => [r.id, r]));
     const ordered = ids.map(id => rowMap.get(id)).filter((r): r is UserPromptRecord => !!r);
-    return limit ? ordered.slice(0, limit) : ordered;
+    return ordered.slice(offset, limit ? offset + limit : undefined);
   }
 
   getTimelineAroundTimestamp(

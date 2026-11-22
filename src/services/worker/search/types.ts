@@ -84,6 +84,7 @@ export interface StrategySearchResult {
   results: SearchResults;
   usedChroma: boolean;
   strategy: SearchStrategyHint;
+  hasHitsBeforeOffset?: Partial<Record<SearchCategory, boolean>>;
 }
 
 export interface CombinedResult {

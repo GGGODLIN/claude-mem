@@ -2,6 +2,7 @@
 import {
   StrategySearchOptions,
   SearchSelection,
+  SearchCategory,
   StrategySearchResult,
   SEARCH_CONSTANTS,
   isCategoryRequested,
@@ -18,6 +19,18 @@ import { logger } from '../../../../utils/logger.js';
 import { normalizePlatformSource } from '../../../../shared/platform-source.js';
 import { resolveDateBound } from '../../../../shared/date-bounds.js';
 import { buildProjectWhereFilter, projectReadKeysFor } from '../project-where-filter.js';
+
+function safePositiveLimit(value: unknown, fallback: number): number {
+  if (typeof value === 'boolean') return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function safeNonNegativeOffset(value: unknown): number {
+  if (typeof value === 'boolean') return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
 
 export class ChromaSearchStrategy {
   constructor(
@@ -41,6 +54,7 @@ export class ChromaSearchStrategy {
       concepts,
       files,
       limit = SEARCH_CONSTANTS.DEFAULT_LIMIT,
+      offset = 0,
       project,
       projects,
       platformSource,
@@ -52,6 +66,9 @@ export class ChromaSearchStrategy {
     if (!query) {
       return this.emptyResult('chroma');
     }
+
+    const safeLimit = safePositiveLimit(limit, SEARCH_CONSTANTS.DEFAULT_LIMIT);
+    const safeOffset = safeNonNegativeOffset(offset);
 
     const searchObservations = isCategoryRequested(searchType, 'observations');
     const searchSessions = isCategoryRequested(searchType, 'sessions');
@@ -66,7 +83,7 @@ export class ChromaSearchStrategy {
 
     return await this.executeChromaSearch(query, whereFilter, {
       searchObservations, searchSessions, searchPrompts,
-      obsType, concepts, files, orderBy, limit, project,
+      obsType, concepts, files, orderBy, limit: safeLimit, offset: safeOffset, project,
       projects: readKeys.length > 0 ? readKeys : undefined,
       platformSource, dateRange, ignoreDefaultRecencyWindow
     });
@@ -84,6 +101,7 @@ export class ChromaSearchStrategy {
       files?: string | string[];
       orderBy: 'relevance' | 'date_desc' | 'date_asc';
       limit: number;
+      offset: number;
       project?: string;
       projects?: string[];
       platformSource?: string;
@@ -91,9 +109,10 @@ export class ChromaSearchStrategy {
       ignoreDefaultRecencyWindow: boolean;
     }
   ): Promise<StrategySearchResult> {
+    const batchSize = Math.max(SEARCH_CONSTANTS.CHROMA_BATCH_SIZE, options.offset + options.limit);
     const chromaResults = await this.chromaSync.queryChroma(
       query,
-      SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
+      batchSize,
       whereFilter
     );
 
@@ -111,6 +130,7 @@ export class ChromaSearchStrategy {
     let observations: ObservationSearchResult[] = [];
     let sessions: SessionSummarySearchResult[] = [];
     let prompts: UserPromptSearchResult[] = [];
+    const hasHitsBeforeOffset: Partial<Record<SearchCategory, boolean>> = {};
 
     const sqlOrderBy = options.orderBy;
 
@@ -121,37 +141,73 @@ export class ChromaSearchStrategy {
         files: options.files,
         orderBy: sqlOrderBy,
         limit: options.limit,
+        offset: options.offset,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
       };
       observations = this.sessionStore.getObservationsByIds(categorized.obsIds, obsOptions);
+      if (observations.length === 0 && options.offset > 0) {
+        const unpaged = this.sessionStore.getObservationsByIds(categorized.obsIds, {
+          ...obsOptions,
+          limit: 1,
+          offset: 0
+        });
+        if (unpaged.length > 0) {
+          hasHitsBeforeOffset.observations = true;
+        }
+      }
     }
 
     if (categorized.sessionIds.length > 0) {
-      sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
+      const sessionOptions = {
         orderBy: sqlOrderBy,
         limit: options.limit,
+        offset: options.offset,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
-      });
+      };
+      sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, sessionOptions);
+      if (sessions.length === 0 && options.offset > 0) {
+        const unpaged = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
+          ...sessionOptions,
+          limit: 1,
+          offset: 0
+        });
+        if (unpaged.length > 0) {
+          hasHitsBeforeOffset.sessions = true;
+        }
+      }
     }
 
     if (categorized.promptIds.length > 0) {
-      prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
+      const promptOptions = {
         orderBy: sqlOrderBy,
         limit: options.limit,
+        offset: options.offset,
         project: options.project,
         projects: options.projects,
         platformSource: options.platformSource
-      });
+      };
+      prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, promptOptions);
+      if (prompts.length === 0 && options.offset > 0) {
+        const unpaged = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
+          ...promptOptions,
+          limit: 1,
+          offset: 0
+        });
+        if (unpaged.length > 0) {
+          hasHitsBeforeOffset.prompts = true;
+        }
+      }
     }
 
     return {
       results: { observations, sessions, prompts },
       usedChroma: true,
-      strategy: 'chroma'
+      strategy: 'chroma',
+      ...(Object.keys(hasHitsBeforeOffset).length > 0 ? { hasHitsBeforeOffset } : {}),
     };
   }
 

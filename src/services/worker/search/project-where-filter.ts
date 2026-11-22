@@ -9,7 +9,7 @@ import { scopedProjects } from '../../sqlite/project-read-keys.js';
  * string. Empty when the search is not scoped to a project.
  */
 export function projectReadKeysFor(
-  sessionStore: Pick<SessionStore, 'getProjectReadKeys'>,
+  sessionStore: Pick<SessionStore, 'getProjectReadKeys'> | null | undefined,
   project: unknown,
   projects: unknown
 ): string[] {
@@ -17,7 +17,10 @@ export function projectReadKeysFor(
     ? projects.split(',')
     : Array.isArray(projects) ? projects.filter((entry): entry is string => typeof entry === 'string') : [];
   const requested = scopedProjects({ projects: [...(typeof project === 'string' ? [project] : []), ...listed] });
-  return requested.length > 0 ? sessionStore.getProjectReadKeys(requested) : [];
+  if (requested.length === 0) return [];
+  return typeof sessionStore?.getProjectReadKeys === 'function'
+    ? sessionStore.getProjectReadKeys(requested)
+    : requested;
 }
 
 /**
