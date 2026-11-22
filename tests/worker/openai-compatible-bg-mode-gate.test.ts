@@ -266,6 +266,9 @@ const ENV_KEYS = [
   'CLAUDE_MEM_OBSERVE_BARE_PROMPTS',
   'CLAUDE_MEM_BG_MODE_FILE',
   'CLAUDE_MEM_MAGPIE_CONCURRENCY_URL',
+  'CLAUDE_MEM_OBS_GATE_MODE',
+  'CLAUDE_MEM_OBS_GATE_ENABLED',
+  'CLAUDE_MEM_OBS_GATE_THRESHOLD',
 ] as const;
 
 describe('CLAUDE_MEM_SKIP_TOOLS 7 zero-value built-in tools', () => {
@@ -471,6 +474,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   }
 
   it('qualified GPT observation sends model, effort and pinned account, stores the draft, and preserves the session model', async () => {
+    process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     const gw = await writerGateway();
     try {
       const { session } = await positiveControl(gw);
@@ -842,7 +846,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   });
 
-  it('keeps >=0.20 observations, drops <0.20 while preserving history & usage, and skips gate on <skip_summary />', async () => {
+  it('in model mode keeps >=0.35 observations, drops <0.35 while preserving history & usage, and skips gate on <skip_summary />', async () => {
+    process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
     let turn = 0;
 
@@ -877,8 +882,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       },
       onSystemOne: (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const score = gw.systemOneRequests.length === 1 ? 0.20 : 0.19;
-      const questions = req.body.questions as { keep_observation?: { type?: string } } | undefined;
+        const score = gw.systemOneRequests.length === 1 ? 0.35 : 0.34;
+        const questions = req.body.questions as { keep_observation?: { type?: string } } | undefined;
         expect(req.body.model).toBe('group/obs-gate');
         expect(req.headers.authorization).toBe('Bearer synthetic-gate-key');
         expect(questions?.keep_observation?.type).toBe('noul');
@@ -965,7 +970,162 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   });
 
+  it('defaults to zero-LLM rules mode (Arm 1): 0 SystemOne calls, drops routine echoes & duplicates, protects negative findings & mutations', async () => {
+    writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
+    const replies = [
+      // Batch 1 (2 turns): negative investigative finding -> KEEP; pure git commit echo -> DROP
+      '<observation><type>discovery</type><title>Removing com.apple.macl did not resolve launchd EX_CONFIG</title><subtitle>Exit status 78 persisted after xattr cleanup</subtitle><narrative>Confirmed EX_CONFIG remained after removing com.apple.macl from log files.</narrative><facts><fact>launchd returned EX_CONFIG(78) even after xattr -d com.apple.macl</fact></facts></observation>',
+      '<observation><type>change</type><title>Committed the launchd plist updates</title><subtitle>Staged and committed plist edits</subtitle><narrative>Ran git add and git commit for launchd updates.</narrative><files_modified><file>watcher.plist</file></files_modified></observation>',
+      // Batch 2 (2 turns): release tag push -> KEEP; bash -n syntax check pass -> DROP
+      '<observation><type>change</type><title>Committed dist ignore rule and pushed release tag</title><subtitle>Tagged v0.1.0 release</subtitle><narrative>Pushed tag v0.1.0 to origin.</narrative></observation>',
+      '<observation><type>discovery</type><title>Wrapper syntax check passed after formatter changes</title><subtitle>bash -n returned exit 0</subtitle><narrative>Syntax check succeeded with no warnings.</narrative></observation>',
+      // Batch 3 (2 turns): discovery -> KEEP; near-duplicate discovery in same session -> DROP
+      '<observation><type>discovery</type><title>Fetcher stores only the first DeepSeek balance entry</title><subtitle>Reads balance_infos[0]</subtitle><narrative>fetchDeepSeekBalance only keeps index 0 from balance_infos array.</narrative></observation>',
+      '<observation><type>discovery</type><title>DeepSeek fetcher stores only the first balance entry</title><subtitle>Reads balance_infos[0]</subtitle><narrative>fetchDeepSeekBalance keeps only index 0 from balance_infos.</narrative></observation>',
+      // Batch 4 (2 turns): two distinct edits to same file -> BOTH KEEP
+      '<observation><type>change</type><title>Disabled the unconfigured international Kimi command</title><subtitle>Removed ccp-kimi</subtitle><narrative>Commented out ccp-kimi in ccp-functions.sh.</narrative><files_modified><file>ccp-functions.sh</file></files_modified></observation>',
+      '<observation><type>change</type><title>Disabled the unconfigured mainland GLM command</title><subtitle>Removed ccp-glm</subtitle><narrative>Commented out ccp-glm in ccp-functions.sh.</narrative><files_modified><file>ccp-functions.sh</file></files_modified></observation>',
+    ];
+    let turn = 0;
+
+    const gw = await startFakeGateway({
+      onChat: () => ({
+        body: {
+          model: 'bg-mem-quality',
+          choices: [{ message: { role: 'assistant', content: replies[turn++] ?? OBSERVATION_XML }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 300, completion_tokens: 50, total_tokens: 350 },
+        },
+      }),
+    });
+
+    try {
+      process.env.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL = gw.baseUrl;
+      delete process.env.CLAUDE_MEM_OBS_GATE_MODE;
+      delete process.env.CLAUDE_MEM_OBS_GATE_ENABLED;
+
+      // Batch 1: negative finding kept, pure git commit dropped
+      const q1 = makeQueueAndDb([
+        makeObs(201, { tool_name: 'Bash', tool_input: { command: 'xattr -d com.apple.macl logs/*' }, tool_response: 'EX_CONFIG' }),
+        makeObs(202, { tool_name: 'Bash', tool_input: { command: 'git add watcher.plist && git commit -m "fix"' }, tool_response: '[main abc] fix' }),
+      ]);
+      await new OpenAICompatProvider(q1.dbManager, q1.sessionManager).startSession(makeSession());
+      expect(q1.storeObservations).toHaveBeenCalledTimes(1);
+      expect(q1.confirmCalls).toBe(2);
+
+      // Batch 2: release tag push kept, bash -n syntax pass dropped
+      const q2 = makeQueueAndDb([
+        makeObs(203, { tool_name: 'Bash', tool_input: { command: 'git push origin main --tags' }, tool_response: '* [new tag] v0.1.0' }),
+        makeObs(204, { tool_name: 'Bash', tool_input: { command: 'bash -n scripts/wrapper.sh' }, tool_response: '' }),
+      ]);
+      await new OpenAICompatProvider(q2.dbManager, q2.sessionManager).startSession(makeSession());
+      expect(q2.storeObservations).toHaveBeenCalledTimes(1);
+      expect(q2.confirmCalls).toBe(2);
+
+      // Batch 3: discovery kept, near-duplicate discovery dropped while keeping conversation history
+      const q3 = makeQueueAndDb([
+        makeObs(205, { tool_name: 'Read', tool_input: { file_path: 'background.js' }, tool_response: 'balance_infos[0]' }),
+        makeObs(206, { tool_name: 'Read', tool_input: { file_path: 'background.js' }, tool_response: 'balance_infos[0]' }),
+      ]);
+      const dupSession = makeSession();
+      await new OpenAICompatProvider(q3.dbManager, q3.sessionManager).startSession(dupSession);
+      expect(q3.storeObservations).toHaveBeenCalledTimes(1);
+      expect(q3.confirmCalls).toBe(2);
+      expect(dupSession.conversationHistory.filter(m => m.role === 'assistant')).toHaveLength(2);
+
+      // Batch 4: two distinct edits to same file both kept
+      const q4 = makeQueueAndDb([
+        makeObs(207, { tool_name: 'Edit', tool_input: { file_path: 'ccp-functions.sh' }, tool_response: 'ok' }),
+        makeObs(208, { tool_name: 'Edit', tool_input: { file_path: 'ccp-functions.sh' }, tool_response: 'ok' }),
+      ]);
+      await new OpenAICompatProvider(q4.dbManager, q4.sessionManager).startSession(makeSession());
+      expect(q4.storeObservations).toHaveBeenCalledTimes(2);
+      expect(q4.confirmCalls).toBe(2);
+
+      // Zero external SystemOne calls in default rules mode!
+      expect(gw.systemOneRequests).toHaveLength(0);
+      const ruleLogs = infoLogs.filter(l => l.component === 'OBS_GATE' && l.message.includes('gate_model=local-rules'));
+      expect(ruleLogs).toHaveLength(8);
+      expect(ruleLogs.filter(l => l.message.includes('gate_verdict=DROP'))).toHaveLength(3);
+      expect(ruleLogs.some(l => l.message.includes('reason=routine_git_bookkeeping'))).toBe(true);
+      expect(ruleLogs.some(l => l.message.includes('reason=routine_syntax_check_pass'))).toBe(true);
+      expect(ruleLogs.some(l => l.message.includes('reason=near_dup_discovery'))).toBe(true);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  it('supports CLAUDE_MEM_OBS_GATE_MODE=off (Arm 0), CLAUDE_MEM_OBS_GATE_ENABLED=false, and upgraded model mode (Arm 2) with prior_session_titles and 4k cap', async () => {
+    writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
+    let chatTurn = 0;
+
+    const gw = await startFakeGateway({
+      onChat: () => {
+        chatTurn += 1;
+        const xml = chatTurn === 1
+          ? '<observation><type>change</type><title>Committed the launchd plist updates</title><subtitle>commit</subtitle><narrative>Ran git commit.</narrative></observation>'
+          : OBSERVATION_XML.replace('Updated post-draft gatekeeper', 'Committed post-draft gatekeeper');
+        return {
+          body: {
+            model: 'bg-mem-quality',
+            choices: [{ message: { role: 'assistant', content: xml }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 400, completion_tokens: 50, total_tokens: 450 },
+          },
+        };
+      },
+      onSystemOne: (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ answers: { keep_observation: { noul: 0.48 } } }));
+      },
+    });
+
+    try {
+      process.env.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL = gw.baseUrl;
+
+      // 1. Arm 0 via CLAUDE_MEM_OBS_GATE_MODE=off -> 0 SystemOne calls, bypasses even routine git commit rule
+      process.env.CLAUDE_MEM_OBS_GATE_MODE = 'off';
+      const qOff = makeQueueAndDb([
+        makeObs(211, { tool_name: 'Bash', tool_input: { command: 'git add a.ts && git commit -m "x"' }, tool_response: 'ok' }),
+      ]);
+      await new OpenAICompatProvider(qOff.dbManager, qOff.sessionManager).startSession(makeSession());
+      expect(gw.systemOneRequests).toHaveLength(0);
+      expect(qOff.storeObservations).toHaveBeenCalledTimes(1);
+      expect(infoLogs.some(l => l.component === 'OBS_GATE' && l.message.includes('gate_verdict=GATE_DISABLED'))).toBe(true);
+
+      // 2. Legacy toggle CLAUDE_MEM_OBS_GATE_ENABLED=false overrides mode -> off
+      process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
+      process.env.CLAUDE_MEM_OBS_GATE_ENABLED = 'false';
+      chatTurn = 0;
+      const qLegacyOff = makeQueueAndDb([
+        makeObs(212, { tool_name: 'Edit', tool_input: { file_path: 'a.ts' }, tool_response: 'ok' }),
+      ]);
+      await new OpenAICompatProvider(qLegacyOff.dbManager, qLegacyOff.sessionManager).startSession(makeSession());
+      expect(gw.systemOneRequests).toHaveLength(0);
+      expect(qLegacyOff.storeObservations).toHaveBeenCalledTimes(1);
+
+      // 3. Opt-in Arm 2 (model mode) with custom threshold=0.50 -> prob=0.48 drops, prior_session_titles carries Turn 1 title, outcome capped at 4000 chars
+      delete process.env.CLAUDE_MEM_OBS_GATE_ENABLED;
+      process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
+      process.env.CLAUDE_MEM_OBS_GATE_THRESHOLD = '0.50';
+      chatTurn = 0;
+      const qModel = makeQueueAndDb([
+        makeObs(213, { tool_name: 'Edit', tool_input: { file_path: 'a.ts' }, tool_response: 'x'.repeat(6000) }),
+        makeObs(214, { tool_name: 'Bash', tool_input: { command: 'git commit' }, tool_response: 'committed' }),
+      ]);
+      await new OpenAICompatProvider(qModel.dbManager, qModel.sessionManager).startSession(makeSession());
+      expect(gw.systemOneRequests).toHaveLength(2);
+      const firstState = gw.systemOneRequests[0].body.state as { outcome: string; prior_session_titles: string[] };
+      const secondState = gw.systemOneRequests[1].body.state as { prior_session_titles: string[] };
+      expect(firstState.outcome.length).toBe(4000);
+      expect(firstState.prior_session_titles).toEqual([]);
+      expect(secondState.prior_session_titles).toEqual(['Committed the launchd plist updates']);
+      expect(qModel.storeObservations).not.toHaveBeenCalled();
+    } finally {
+      await gw.close();
+    }
+  });
+
   it('fails open with GATE_ERROR and stores draft when /v1/systemone omits noul or returns non-finite value (F2)', async () => {
+    process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
     const badPayloads = [
       {},
@@ -1012,6 +1172,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   });
 
   it('single-leg fail-open stores draft on 404, 429, 500, and timeout without blocking the queue (F4)', async () => {
+    process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     writeFileSync(bgModePath, JSON.stringify({ mode: 'eco' }));
     let mode: '404' | '429' | '500' | 'timeout' = '404';
 
@@ -1124,6 +1285,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   }
 
   it('unregistered Stop summary and field compression keep their original recipe; registered tasks use GPT (F5)', async () => {
+    process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     const gw = await writerGateway(taskReply);
     try {
       writeFileSync(bgModePath, JSON.stringify({ mode: 'quality', profile: 'current' }));
