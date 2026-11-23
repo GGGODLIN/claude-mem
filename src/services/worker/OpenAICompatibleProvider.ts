@@ -7,9 +7,10 @@ import { join } from 'path';
 import { DatabaseManager } from './DatabaseManager.js';
 import { SessionManager } from './SessionManager.js';
 import { logger } from '../../utils/logger.js';
+import { redactSensitive } from '../../utils/redaction.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import { parseAgentXml } from '../../sdk/parser.js';
+import { parseAgentXml, type ParsedObservation } from '../../sdk/parser.js';
 import {
   buildInitPrompt,
   buildObservationPromptParts,
@@ -184,6 +185,24 @@ function resolveObsGateThreshold(): number {
 function normalizeGateField(value: unknown, maxChars: number): string {
   const text = typeof value === 'string' ? value : (JSON.stringify(value) ?? '');
   return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
+// The draft can echo credentials even when capture-time redaction is disabled.
+function normalizeDropPreviewField(value: string | null): string {
+  const { redacted } = redactSensitive(value ?? '', { enabled: true });
+  return redacted.replace(/["\\]/g, "'").replace(/[\s\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
+}
+
+function formatDropPreview(observation: ParsedObservation): string {
+  const type = normalizeDropPreviewField(observation.type);
+  const dropType = /^[a-z][a-z0-9_-]{0,31}$/i.test(type) ? type : 'unknown';
+  const title = normalizeDropPreviewField(observation.title);
+  const summary = normalizeDropPreviewField(observation.subtitle) || normalizeDropPreviewField(observation.narrative);
+  const preview = [title, summary]
+    .filter(Boolean)
+    .map(text => Array.from(text).slice(0, 120).join(''))
+    .join(' | ');
+  return ` drop_type=${dropType} drop_preview="${preview}"`;
 }
 
 /** The relay header that makes it try one account only. */
@@ -965,6 +984,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
         );
       } else {
         const gateMode = resolveObsGateMode();
+        // Both gates decide the entire turn. Preview its first observation to keep one bounded receipt per turn.
+        const firstObservation = parsed.observations[0];
         let shouldDrop = false;
 
         if (gateMode === 'off') {
@@ -980,12 +1001,13 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
             observations: parsed.observations,
             priorObservations: extractPriorSessionObservations(session.conversationHistory),
           });
+          shouldDrop = ruleOutcome.verdict === 'DROP';
+          const dropSuffix = shouldDrop ? formatDropPreview(firstObservation) : '';
           logger.info(
             'OBS_GATE',
-            `mode=${bgMode} writer=${writerSource} gate_verdict=${ruleOutcome.verdict} gate_model=local-rules prob=n/a reason=${ruleOutcome.reason}`,
+            `mode=${bgMode} writer=${writerSource} gate_verdict=${ruleOutcome.verdict} gate_model=local-rules prob=n/a reason=${ruleOutcome.reason}${dropSuffix}`,
             { sessionId: session.sessionDbId },
           );
-          shouldDrop = ruleOutcome.verdict === 'DROP';
         } else {
           const gateFieldCap = Math.min(fieldMaxChars, OBS_GATE_FIELD_MAX_CHARS);
           const outcome = await evaluateObservationGate({
@@ -1000,12 +1022,13 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
           });
           const probText = outcome.prob !== null ? outcome.prob.toFixed(4) : 'n/a';
           const reasonSuffix = outcome.reason ? ` reason=${outcome.reason}` : '';
+          shouldDrop = outcome.verdict === 'DROP';
+          const dropSuffix = shouldDrop ? formatDropPreview(firstObservation) : '';
           logger.info(
             'OBS_GATE',
-            `mode=${bgMode} writer=${writerSource} gate_verdict=${outcome.verdict} gate_model=${OBS_GATE_MODEL} prob=${probText}${reasonSuffix}`,
+            `mode=${bgMode} writer=${writerSource} gate_verdict=${outcome.verdict} gate_model=${OBS_GATE_MODEL} prob=${probText}${reasonSuffix}${dropSuffix}`,
             { sessionId: session.sessionDbId },
           );
-          shouldDrop = outcome.verdict === 'DROP';
         }
 
         if (shouldDrop) {

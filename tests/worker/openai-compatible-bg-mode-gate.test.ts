@@ -963,7 +963,14 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
         expect(r.message).toContain('prob=');
       }
       expect(gateReceipts.some(r => r.message.includes('gate_verdict=KEEP') && r.message.includes('gate_model=group/obs-gate'))).toBe(true);
-      expect(gateReceipts.some(r => r.message.includes('gate_verdict=DROP'))).toBe(true);
+      const modelDrops = gateReceipts.filter(r => r.message.includes('gate_verdict=DROP'));
+      expect(modelDrops).toHaveLength(2);
+      for (const { message } of modelDrops) {
+        expect(message).toMatch(/gate_verdict=DROP gate_model=group\/obs-gate prob=0\.3400 .*drop_type=\w+ drop_preview="[^"]+"$/);
+      }
+      for (const { message } of gateReceipts.filter(r => !r.message.includes('gate_verdict=DROP'))) {
+        expect(message).not.toMatch(/drop_(type|preview)=/);
+      }
       expect(gateReceipts.some(r => r.message.includes('gate_verdict=WRITER_SKIP') && r.message.includes('gate_model=none') && r.message.includes('prob=n/a'))).toBe(true);
     } finally {
       await gw.close();
@@ -972,10 +979,15 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
 
   it('defaults to zero-LLM rules mode (Arm 1): 0 SystemOne calls, drops routine echoes & duplicates, protects negative findings & mutations', async () => {
     writeFileSync(bgModePath, JSON.stringify({ mode: 'quality' }));
+    const rawToolOutput = 'synthetic-raw-output-marker';
+    const echoedCredential = `sk-${'X'.repeat(24)}`;
+    const summary = 'Staged and committed plist edits';
+    const sanitizedSummary = `${summary} <redacted type='openai_key'/> `;
+    const previewPadding = '測'.repeat(119 - sanitizedSummary.length);
     const replies = [
       // Batch 1 (2 turns): negative investigative finding -> KEEP; pure git commit echo -> DROP
       '<observation><type>discovery</type><title>Removing com.apple.macl did not resolve launchd EX_CONFIG</title><subtitle>Exit status 78 persisted after xattr cleanup</subtitle><narrative>Confirmed EX_CONFIG remained after removing com.apple.macl from log files.</narrative><facts><fact>launchd returned EX_CONFIG(78) even after xattr -d com.apple.macl</fact></facts></observation>',
-      '<observation><type>change</type><title>Committed the launchd plist updates</title><subtitle>Staged and committed plist edits</subtitle><narrative>Ran git add and git commit for launchd updates.</narrative><files_modified><file>watcher.plist</file></files_modified></observation>',
+      `<observation><type>change</type><title>Committed the &quot;launchd&quot;\nplist updates</title><subtitle>${summary}\r\n${echoedCredential}\t${previewPadding}𠮷truncated</subtitle><narrative>Ran git add and git commit for launchd updates.</narrative><files_modified><file>watcher.plist</file></files_modified></observation>`,
       // Batch 2 (2 turns): release tag push -> KEEP; bash -n syntax check pass -> DROP
       '<observation><type>change</type><title>Committed dist ignore rule and pushed release tag</title><subtitle>Tagged v0.1.0 release</subtitle><narrative>Pushed tag v0.1.0 to origin.</narrative></observation>',
       '<observation><type>discovery</type><title>Wrapper syntax check passed after formatter changes</title><subtitle>bash -n returned exit 0</subtitle><narrative>Syntax check succeeded with no warnings.</narrative></observation>',
@@ -1006,7 +1018,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       // Batch 1: negative finding kept, pure git commit dropped
       const q1 = makeQueueAndDb([
         makeObs(201, { tool_name: 'Bash', tool_input: { command: 'xattr -d com.apple.macl logs/*' }, tool_response: 'EX_CONFIG' }),
-        makeObs(202, { tool_name: 'Bash', tool_input: { command: 'git add watcher.plist && git commit -m "fix"' }, tool_response: '[main abc] fix' }),
+        makeObs(202, { tool_name: 'Bash', tool_input: { command: 'git add watcher.plist && git commit -m "fix"' }, tool_response: rawToolOutput }),
       ]);
       await new OpenAICompatProvider(q1.dbManager, q1.sessionManager).startSession(makeSession());
       expect(q1.storeObservations).toHaveBeenCalledTimes(1);
@@ -1049,6 +1061,15 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
       expect(ruleLogs.some(l => l.message.includes('reason=routine_git_bookkeeping'))).toBe(true);
       expect(ruleLogs.some(l => l.message.includes('reason=routine_syntax_check_pass'))).toBe(true);
       expect(ruleLogs.some(l => l.message.includes('reason=near_dup_discovery'))).toBe(true);
+      expect(ruleLogs[1].message).toBe(
+        'mode=quality writer=bg-mem-quality gate_verdict=DROP gate_model=local-rules prob=n/a reason=routine_git_bookkeeping' +
+        ` drop_type=change drop_preview="Committed the 'launchd' plist updates | ${sanitizedSummary}${previewPadding}𠮷"`,
+      );
+      expect(ruleLogs[1].message).not.toContain(rawToolOutput);
+      expect(ruleLogs[1].message).not.toContain(echoedCredential);
+      for (const { message } of ruleLogs.filter(l => l.message.includes('gate_verdict=KEEP'))) {
+        expect(message).not.toMatch(/drop_(type|preview)=/);
+      }
     } finally {
       await gw.close();
     }
