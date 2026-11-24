@@ -91,6 +91,56 @@ describe('obs-gate-rules (Arm 1 zero-LLM deterministic filter)', () => {
     ).toBe('KEEP');
   });
 
+  it('protects mixed pass+fail summaries from routine_verification_pass drops while still dropping clean exit-0 passes', () => {
+    // Regression for 2026-11-23 14:20 false drop: positive-looking pass title + failure in subtitle/narrative
+    expect(
+      evaluateObservationRules({
+        toolName: 'Bash',
+        toolInput: { command: 'pytest tests/' },
+        observations: [
+          makeObs({
+            title: 'Wave 13 BF3 cross-seat tests pass only for me-distill cron',
+            subtitle: 'Both cron runs passed, while the Python and Bun suites failed in both directions across all three BF3 repositories.',
+            narrative: 'Cron verification passed, but Python and Bun suites failed.',
+          }),
+        ],
+        priorObservations: [],
+      }).verdict,
+    ).toBe('KEEP');
+
+    // Failure only in narrative/facts with a plain passing title must also be kept
+    expect(
+      evaluateObservationRules({
+        toolName: 'Bash',
+        toolInput: { command: 'bun test' },
+        observations: [
+          makeObs({
+            title: 'Smoke tests passed after restart',
+            subtitle: 'Core checks completed',
+            narrative: 'Health check passed, but integration check exited with code 1.',
+          }),
+        ],
+        priorObservations: [],
+      }).verdict,
+    ).toBe('KEEP');
+
+    // Benign "exit code 0" / "0 failed" summaries must still drop as routine verification pass
+    expect(
+      evaluateObservationRules({
+        toolName: 'Bash',
+        toolInput: { command: 'python3 -m unittest discover' },
+        observations: [
+          makeObs({
+            title: 'All 157 chatgpt-desktop-factory tests passed',
+            subtitle: 'Python unittest discovery completed in 640.130 seconds with exit code 0.',
+            narrative: '157 passed, 0 failed, 0 errors.',
+          }),
+        ],
+        priorObservations: [],
+      }),
+    ).toEqual({ verdict: 'DROP', reason: 'routine_verification_pass' });
+  });
+
   it('never drops security_alert or decision unless exact title duplicate', () => {
     const sec = evaluateObservationRules({
       toolName: 'Bash',

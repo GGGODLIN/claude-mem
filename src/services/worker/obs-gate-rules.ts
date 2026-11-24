@@ -22,6 +22,20 @@ const STOP_WORDS = new Set([
 // Protects negative investigative findings, root causes, and defect clues from routine-echo drops.
 const NEGATIVE_OR_DEFECT_RE = /\b(not|no|none|never|without|cannot|can't|couldn't|didn't|doesn't|isn't|aren't|wasn't|weren't|did\s+not|does\s+not|do\s+not|will\s+not|could\s+not|missing|omit|omits|omitted|absent|lacks?|unavailable|unreachable|unconfigured|fail|fails|failed|failing|failure|error|errors|err|exception|crash|crashed|panic|broken|bug|defect|mismatch|conflict|conflicts|reject|rejected|refused|denied|blocked|stale|outdated|exceeds?|overflow|timeout|timed\s+out|loop|stall|stalls|hang|hung|exited|exit\s+status|exit\s+code|ex_config|warning|disappeared|reverses?|hardcodes?)\b/i;
 
+// Narrower negative-cue detector for subtitle/narrative/facts so mixed pass+fail summaries
+// (e.g. "cron passed, while Python and Bun suites failed") are protected without tripping on
+// benign pass phrases like "exit code 0" or "0 failed".
+const ZERO_FAILURE_PHRASE_RE = /\b(?:0|zero|no)\s+(?:fail(?:s|ed|ures?)?|errors?|broken)\b/gi;
+const SUMMARY_FAILURE_RE = /\b(fail|fails|failed|failing|failure|failures|broken|crash|crashed|panic|panicked|timed\s+out|aborted|unhealthy|unverified|blocked\s+by|exit(?:ed)?\s+(?:with\s+)?(?:status|code)\s+(?!0\b)\d+)\b/i;
+const PARTIAL_PASS_RE = /\bpass(?:ed|es)?\s+only\b|\bonly\s+[^.!?;]{1,40}\s+pass(?:ed|es)?\b/i;
+
+function hasSummaryFailureCue(title: string, summaryText: string): boolean {
+  if (PARTIAL_PASS_RE.test(title)) return true;
+  if (!summaryText) return false;
+  const cleaned = summaryText.replace(ZERO_FAILURE_PHRASE_RE, ' ');
+  return SUMMARY_FAILURE_RE.test(cleaned) || PARTIAL_PASS_RE.test(cleaned);
+}
+
 const GIT_BOOKKEEPING_CMD_RE = /^\s*(?:\(\s*)?(?:cd\s+[^&;|\n]+\s*&&\s*)?git\s+(?:status|add|commit|push)\b/i;
 const GIT_BOOKKEEPING_TITLE_RE = /^(?:committed|pushed|staged)\b|\b(?:are\s+uncommitted|uncommitted\s+.*changes|working\s+tree\s+contains\s+uncommitted)\b/i;
 const GIT_RELEASE_TAG_RE = /(?:--tags\b|\bgit\s+tag\b|\brelease\s+tag\b|\bgh\s+release\b)/i;
@@ -202,7 +216,7 @@ export function extractPriorSessionObservations(
         titleTokens: tokenizeObsText(title),
         bodyTokens: tokenizeObsText(`${title} ${subtitle} ${narrative.slice(0, 260)} ${facts.slice(0, 260)}`),
         filesModified,
-        hasNeg: NEGATIVE_OR_DEFECT_RE.test(title),
+        hasNeg: NEGATIVE_OR_DEFECT_RE.test(title) || hasSummaryFailureCue(title, `${subtitle} ${narrative} ${facts}`),
       });
     }
   }
@@ -224,7 +238,7 @@ function evaluateSingleObservation(
   const titleTokens = tokenizeObsText(title);
   const bodyTokens = tokenizeObsText(`${title} ${subtitle} ${narrative.slice(0, 260)} ${factsStr.slice(0, 260)}`);
   const filesMod = normalizeFileBasenames(obs.files_modified);
-  const hasNeg = NEGATIVE_OR_DEFECT_RE.test(title);
+  const hasNeg = NEGATIVE_OR_DEFECT_RE.test(title) || hasSummaryFailureCue(title, `${subtitle} ${narrative} ${factsStr}`);
   const isEditTool = toolName === 'Edit' || toolName === 'Write' || toolName === 'NotebookEdit';
 
   if (obsType === 'security_alert' || obsType === 'decision') {
