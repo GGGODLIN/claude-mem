@@ -239,18 +239,13 @@ export function parseBgWriterState(raw: string, taskName: BgWriterTask = 'claude
     const task = isRecord(state.qualified_tasks) ? state.qualified_tasks[taskName] : undefined;
     if (state.profile !== 'gpt' || !isRecord(task) || !isNonEmptyString(task.model)) return { mode };
 
-    const quota = state.quota_target;
-    const provider = task.model.includes('/') ? task.model.split('/')[0] : undefined;
-    const account = isRecord(quota) && isNonEmptyString(quota.provider) && isNonEmptyString(quota.account)
-      && quota.provider === provider ? quota.account : undefined;
+    // quota_target is for UI quota alerts only; omit X-Magpie-Account so Magpie routes across the whole provider pool.
     return {
       mode,
       gptWriter: {
         model: task.model,
         requestOptions: {
           ...(isNonEmptyString(task.effort) ? { reasoningEffort: task.effort } : {}),
-          // The gateway reads this header percent-decoded; a raw non-ASCII name is not a valid header value.
-          ...(account ? { headers: { [PINNED_ACCOUNT_HEADER]: encodeURIComponent(account) } } : {}),
         },
       },
     };

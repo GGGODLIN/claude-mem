@@ -454,7 +454,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   }
 
   function expectGpt(req: RecordedChatRequest) {
-    expect(recipe(req)).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: 'someone%40example.test' });
+    expect(recipe(req)).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: undefined });
   }
 
   function expectStored(q: ReturnType<typeof makeQueueAndDb>) {
@@ -473,7 +473,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     return result;
   }
 
-  it('qualified GPT observation sends model, effort and pinned account, stores the draft, and preserves the session model', async () => {
+  it('qualified GPT observation sends model and effort across the whole pool without pinning an account, stores the draft, and preserves the session model', async () => {
     process.env.CLAUDE_MEM_OBS_GATE_MODE = 'model';
     const gw = await writerGateway();
     try {
@@ -557,6 +557,8 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
   });
 
   for (const [name, quota] of [
+    ['matching quota target', { provider: 'codex', account: 'someone@example.test' }],
+    ['non-ASCII matching quota target', { provider: 'codex', account: '北冥' }],
     ['provider mismatch', { provider: 'google', account: 'someone@example.test' }],
     ['missing quota target', undefined],
     ['empty account', { provider: 'codex', account: '' }],
@@ -564,7 +566,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     ['empty provider', { provider: '', account: 'someone@example.test' }],
     ['array quota target', []],
   ] as const) {
-    it(`omits account header for ${name}, paired with a matching quota target`, async () => {
+    it(`omits account header so Magpie routes across the whole pool for ${name}`, async () => {
       const gw = await writerGateway();
       try {
         await positiveControl(gw);
@@ -578,13 +580,13 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     });
   }
 
-  it('valid task without effort still routes GPT without adding reasoning_effort', async () => {
+  it('valid task without effort still routes GPT without adding reasoning_effort or pinning an account', async () => {
     const gw = await writerGateway();
     try {
       await positiveControl(gw);
       writeFileSync(bgModePath, JSON.stringify({ ...gptState, qualified_tasks: { 'claude-mem/observation': { model: 'codex/gpt-6.1-sol' } } }));
       const { q } = await observe();
-      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: undefined, account: 'someone%40example.test' });
+      expect(recipe(gw.chatRequests[1])).toEqual({ model: 'codex/gpt-6.1-sol', effort: undefined, account: undefined });
       expectStored(q);
     } finally {
       await gw.close();
@@ -621,13 +623,13 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     await fallbackControl(402);
   });
 
-  it('a watched account in other letters is sent percent-encoded and reaches the gateway', async () => {
+  it('a watched account in other letters does not pin the request and reaches the gateway cleanly', async () => {
     const gw = await writerGateway();
     try {
       writeFileSync(bgModePath, JSON.stringify({ ...gptState, quota_target: { provider: 'codex', account: '北冥' } }));
       const { q, session } = await observe();
       expect(gw.chatRequests).toHaveLength(1);
-      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: '%E5%8C%97%E5%86%A5' });
+      expect(recipe(gw.chatRequests[0])).toEqual({ model: 'codex/gpt-6.1-sol', effort: 'high', account: undefined });
       expectStored(q);
       expect(session.paidSendBudget?.spentPaidSends).toBe(1);
     } finally {
@@ -692,15 +694,7 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   });
 
-  it('a refusal that names the pinned account never carries it into the logs or the error', async () => {
-    const named = { status: 429, headers: { 'Retry-After': '0' }, body: { error: { message: 'codex someone@example.test rests until 2026-11-17T03:00:00Z (rate limit)' } } };
-    await fallbackControl(429, named);
-    // Positive control: the warn line for the refused send was captured, so its absence below means something.
-    expect(loudLogs.some(line => line.includes('rests until'))).toBe(true);
-    for (const line of [...loudLogs, ...infoLogs.map(l => logText([l.message, l.context]))]) {
-      expect(line.includes('someone@example.test') || line.includes('someone%40example.test')).toBe(false);
-    }
-
+  it('withoutPinnedAccount still redacts an explicitly passed X-Magpie-Account header', () => {
     const options = { headers: { 'X-Magpie-Account': 'someone%40example.test' } };
     expect(withoutPinnedAccount('codex someone@example.test rests; pinned someone%40example.test', options)).toBe('codex [pinned account] rests; pinned [pinned account]');
     expect(withoutPinnedAccount('codex someone@example.test rests', undefined)).toBe('codex someone@example.test rests');
@@ -787,10 +781,10 @@ describe('OpenAICompatibleProvider bg-mode routing & System One post-draft gatek
     }
   });
 
-  it('pure state parser preserves eco and rejects malformed or unqualified GPT state', () => {
+  it('pure state parser preserves eco, omits X-Magpie-Account even with matching quota_target, and rejects malformed or unqualified GPT state', () => {
     expect(parseBgWriterState(JSON.stringify(gptState))).toEqual({
       mode: 'quality',
-      gptWriter: { model: 'codex/gpt-6.1-sol', requestOptions: { reasoningEffort: 'high', headers: { 'X-Magpie-Account': 'someone%40example.test' } } },
+      gptWriter: { model: 'codex/gpt-6.1-sol', requestOptions: { reasoningEffort: 'high' } },
     });
     expect(parseBgWriterState('{')).toEqual({ mode: 'quality' });
     expect(parseBgWriterState(JSON.stringify({ ...gptState, profile: 'current', mode: 'eco' }))).toEqual({ mode: 'eco' });
